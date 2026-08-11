@@ -2,7 +2,7 @@ ATS VALIDATED MOTOR EEG ANALYSIS
 ================================
 
 XDF:
-C:\Users\Alexander Shaw\ATS_Multimodal\sub-P001\ses-S002\eeg\sub-P001_ses-S002_task-Default_run-006_eeg.xdf
+C:\Users\Alexander Shaw\ATS_Multimodal\ xxx.xdf
 
 Total commanded trials: 6
 Valid trials: 4
