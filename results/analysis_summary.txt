@@ -1,0 +1,21 @@
+ATS VALIDATED MOTOR EEG ANALYSIS
+================================
+
+XDF:
+C:\Users\Alexander Shaw\ATS_Multimodal\sub-P001\ses-S002\eeg\sub-P001_ses-S002_task-Default_run-006_eeg.xdf
+
+Total commanded trials: 6
+Valid trials: 4
+Valid LEFT: 3
+Valid RIGHT: 1
+
+Reaction time mean: 0.6885 s
+Reaction time SD: 0.3213 s
+Reaction time min: 0.1543 s
+Reaction time max: 1.0136 s
+
+EEG filtering: 1.0-40.0 Hz
+Notch: 50.0 Hz
+
+IMPORTANT:
+This analysis is exploratory. Behavioural validation does not constitute EEG artefact rejection.
