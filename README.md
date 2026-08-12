@@ -90,6 +90,99 @@ The current prototype supports:
 - power spectral density analysis
 - time-frequency / ERD-ERS visualisation
 
+## Repository Structure
+
+The repository is organised around the experimental data flow:
+
+```text
+acquisition/
+    ↓
+experiments/
+    ↓
+validation/
+    ↓
+analysis/
+    ↓
+results/
+```
+
+### `acquisition/`
+
+Interfaces to live sensor and event streams.
+
+- `eeg_lsl_stream.py` — streams live EEG data over Lab Streaming Layer
+- `marker_stream.py` — publishes timestamped experimental markers
+
+### `experiments/`
+
+Experiment control and behavioural cue generation.
+
+- `motor_task.py` — LEFT/RIGHT motor-response experiment with timestamped events
+
+### `validation/`
+
+Independent behavioural verification.
+
+- `validate_motor_trials.py` — compares commanded actions against detected physical movement and calculates reaction times
+
+### `analysis/`
+
+Offline multimodal and EEG processing.
+
+- `xdf_to_mne.py` — converts recorded XDF EEG streams into MNE-compatible data
+- `plot_multimodal_xdf.py` — visualises synchronised EEG, event and movement streams
+- `analyse_validated_motor_eeg.py` — generates cue- and movement-aligned EEG analyses from behaviourally validated trials
+
+### `tools/`
+
+Diagnostic utilities for inspecting live LSL streams and recorded XDF files.
+
+### `results/`
+
+Representative outputs from an exploratory motor-response recording.
+
+Raw participant recordings are intentionally excluded from the public repository.
+
+---
+
+## Representative Results
+
+The figures below are included primarily as evidence that the acquisition, synchronisation, validation and analysis pipeline operates end-to-end. The current recording is exploratory and is not intended to support neuroscientific conclusions.
+
+### Behavioural Validation
+
+<p align="center">
+  <img src="results/01_reaction_times.png" width="80%" alt="Validated motor trial reaction times">
+</p>
+
+Four of six commanded trials were behaviourally validated in the current example recording. Movement onset was independently estimated from the motion stream, allowing cue-to-movement reaction time to be calculated.
+
+### Cue-Aligned EEG
+
+<p align="center">
+  <img src="results/02_cue_aligned_eeg.png" width="90%" alt="Cue-aligned EEG">
+</p>
+
+Validated EEG epochs aligned to the experimental cue.
+
+### Movement-Onset-Aligned EEG
+
+<p align="center">
+  <img src="results/03_movement_aligned_eeg.png" width="90%" alt="Movement-onset-aligned EEG">
+</p>
+
+The same validated trials independently aligned to detected physical movement onset rather than the commanded cue.
+
+### Spectral Analysis
+
+<p align="center">
+  <img src="results/04_movement_psd.png" width="90%" alt="Movement-aligned EEG power spectral density">
+</p>
+
+Movement-aligned power spectral density analysis across the five EEG channels.
+
+Additional cue- and movement-aligned time-frequency analyses are available in [`results/`](results/).
+
 ---
 
 ## Example Experiment
