@@ -55,6 +55,7 @@ def discover_streams(
     return sorted(
         streams,
         key=lambda stream: (
+            stream.hostname(),
             stream.name(),
             stream.type(),
         ),
@@ -78,11 +79,12 @@ def print_streams(streams) -> None:
     print(
         f"{'NAME':<24}"
         f"{'TYPE':<14}"
-        f"{'CHANNELS':>10}"
+        f"{'CH':>5}"
         f"{'RATE (Hz)':>13}"
+        f"{'HOST'}"
     )
 
-    print("-" * 61)
+    print("-" * 78)
 
     for stream in streams:
         nominal_rate = float(
@@ -95,11 +97,17 @@ def print_streams(streams) -> None:
             else "irregular"
         )
 
+            hostname = (
+            stream.hostname()
+            or "unknown"
+            )
+
         print(
             f"{stream.name():<24}"
             f"{stream.type():<14}"
-            f"{stream.channel_count():>10}"
+            f"{stream.channel_count():>5}"
             f"{rate_text:>13}"
+            f"{hostname}"
         )
 
     print()
