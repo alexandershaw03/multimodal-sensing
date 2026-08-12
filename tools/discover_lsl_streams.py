@@ -80,7 +80,7 @@ def print_streams(streams) -> None:
         f"{'NAME':<24}"
         f"{'TYPE':<14}"
         f"{'CH':>5}"
-        f"{'RATE (Hz)':>13}"
+        f"{'RATE (Hz)':>13}  "
         f"{'HOST'}"
     )
 
@@ -98,15 +98,15 @@ def print_streams(streams) -> None:
         )
 
             hostname = (
-            stream.hostname()
-            or "unknown"
+                stream.hostname()
+                or "unknown"
             )
 
         print(
             f"{stream.name():<24}"
             f"{stream.type():<14}"
             f"{stream.channel_count():>5}"
-            f"{rate_text:>13}"
+            f"{rate_text:>13}  "
             f"{hostname}"
         )
 
