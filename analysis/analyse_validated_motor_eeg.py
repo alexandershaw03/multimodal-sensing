@@ -1,470 +1,594 @@
-import warnings
+"""
+Validated EEG analysis: for ATS motor-response experiment.
+
+Inputs
+------
+1. Multimodal XDF recording containing ATS_EEG_RAW.
+2. Behavioural validation CSV from validation/validate_motor_trials.py.
+
+Outputs
+-------
+- validated_trials_used.csv
+- cue_aligned-epo.fif
+- movement_aligned-epo.fif
+- reaction-time, average EEG, PSD and ERD/ERS figures
+- analysis_summary.txt
+
+This analysis is exploratory. 
+Behavioural validation confirms that the expected movement occurred. It is not a substitute for artefact rejection.
+
+Usage
+-----
+python analysis/analyse_validated_motor_eeg.py recording.xdf
+
+If validation CSV is omitted, the script looks beside the XDF for:
+    <recording_stem>_validated_trials.csv
+
+Optional:
+python analysis/analyse_validated_motor_eeg.py recording.xdf validation.csv \
+    --output-dir analysis_output --show
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import mne
 import numpy as np
 import pandas as pd
 import pyxdf
-import mne
-import matplotlib.pyplot as plt
-
 from scipy.signal import welch
 
 
-# =========================================================
-# ATS VALIDATED MOTOR EEG ANALYSIS
-#
-# INPUTS:
-#
-#   1. Multimodal XDF
-#   2. validated_trials.csv
-#
-# OUTPUTS:
-#
-#   - validated trial table
-#   - cue-aligned MNE epochs
-#   - movement-aligned MNE epochs
-#   - reaction-time plot
-#   - cue-aligned LEFT vs RIGHT averages
-#   - movement-aligned LEFT vs RIGHT averages
-#   - movement-aligned PSD
-#   - cue-aligned ERD/ERS time-frequency plots
-#   - movement-aligned ERD/ERS time-frequency plots
-#
-# =========================================================
+# ============================================================================
+# ANALYSIS SETTINGS
+# ============================================================================
 
+EEG_STREAM_NAME = "ATS_EEG_RAW"
 
-# =========================================================
-# FILES
-# =========================================================
-
-# Replace "xxx"'s with actual file paths
-XDF_FILE = Path(
-    r" xxx "
-    r" xxx "
-    r" xxx "
-)
-
-# Replace "xxx"'s with actual file paths
-VALIDATION_CSV = Path(
-    r" xxx "
-    r" xxx "
-    r" xxx "
-)
-
-
-OUTPUT_DIR = (
-    XDF_FILE.parent
-    /
-    (
-        XDF_FILE.stem
-        +
-        "_analysis"
-    )
-)
-
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-
-# =========================================================
-# EEG SETTINGS
-# =========================================================
-
-EEG_CHANNELS = [
+EEG_CHANNELS = (
     "AF3",
     "T7",
     "Pz",
     "T8",
-    "AF4"
-]
+    "AF4",
+)
+
+EVENT_ID = {
+    "LEFT": 1,
+    "RIGHT": 2,
+}
 
 
-# Bandpass used for event-related analysis
+# Event-related EEG filtering
 FILTER_LOW = 1.0
 FILTER_HIGH = 40.0
-
 
 # Mains power interference
 NOTCH_FREQ = 50.0
 
 
-# =========================================================
-# EPOCH SETTINGS
-# =========================================================
-
+# Epoch windows
 CUE_TMIN = -2.0
 CUE_TMAX = 3.0
-
 
 MOVEMENT_TMIN = -2.0
 MOVEMENT_TMAX = 2.0
 
 
-# Baseline used for waveform visualisation and time-frequency ERD/ERS calculation.
+# Baseline used for waveform and ERD/ERS calculation/s
 BASELINE_START = -2.0
 BASELINE_END = -1.0
 
 
-# =========================================================
-# TIME-FREQUENCY SETTINGS
-# =========================================================
+# PSD range
+PSD_LOW = 2.0
+PSD_HIGH = 40.0
 
+
+# Morlet TFR:
+# 4-35 Hz, in 1 Hz steps.
 TFR_FREQS = np.arange(
     4.0,
     36.0,
-    1.0
+    1.0,
 )
 
-
-# Approx 0.5 s wavelet duration across frequencies
+# freq / 2 gives approx 0.5s wavelet duration.
 TFR_N_CYCLES = (
-    TFR_FREQS / 2.0
+    TFR_FREQS
+    / 2.0
 )
 
 
-# =========================================================
-# LOAD XDF
-# =========================================================
-
-print()
-print("========================================")
-print(" ATS VALIDATED MOTOR EEG ANALYSIS")
-print("========================================")
-print()
+# ============================================================================
+# DATA MODELS
+# ============================================================================
 
 
-print("Loading XDF:")
-print(XDF_FILE)
-print()
+@dataclass(frozen=True)
+class EEGRecording:
+    """
+    EEG samples and timing extracted from XDF.
+    """
+
+    data_microvolts: np.ndarray
+    timestamps: np.ndarray
+
+    sfreq: float
+    observed_sfreq: float
 
 
-streams, header = pyxdf.load_xdf(
-    str(XDF_FILE)
-)
+@dataclass(frozen=True)
+class EpochBuildResult:
+    """
+    MNE epochs and event-to-nearest-sample timing diagnostics.
+    """
+
+    epochs: mne.Epochs
+    timing_errors_ms: np.ndarray
 
 
-stream_map = {}
+# ============================================================================
+# INPUT / STREAM HELPERS
+# ============================================================================
 
 
-for stream in streams:
+def stream_name(
+    stream: dict,
+) -> str:
+    """
+    Return XDF stream's LSL name.
+    """
 
-    name = stream["info"]["name"][0]
-
-    stream_map[name] = stream
-
-
-if "ATS_EEG_RAW" not in stream_map:
-
-    raise RuntimeError(
-        "ATS_EEG_RAW not found in XDF."
+    return str(
+        stream[
+            "info"
+        ][
+            "name"
+        ][0]
     )
 
 
-eeg_stream = stream_map[
-    "ATS_EEG_RAW"
-]
+def build_stream_map(
+    streams: list[dict],
+) -> dict[str, dict]:
+    """
+    Index XDF streams by LSL name.
+    """
+
+    return {
+        stream_name(stream): stream
+        for stream in streams
+    }
 
 
-# =========================================================
-# LOAD VALIDATION RESULTS
-# =========================================================
+def require_stream(
+    stream_map: dict[str, dict],
+    name: str,
+) -> dict:
+    """
+    Return required XDF stream or raise useful error.
+    """
 
-print("Loading validation CSV:")
-print(VALIDATION_CSV)
-print()
+    if name not in stream_map:
 
+        available = ", ".join(
+            sorted(
+                stream_map
+            )
+        )
 
-validation = pd.read_csv(
-    VALIDATION_CSV
-)
+        raise RuntimeError(
+            f"Required XDF stream '{name}' was not found.\n"
+            f"Available streams: {available or 'none'}"
+        )
 
-
-# Convert overall_valid properly, regardless of whether pandas reads it as bool or text.
-
-validation[
-    "valid_bool"
-] = (
-
-    validation[
-        "overall_valid"
+    stream = stream_map[
+        name
     ]
-    .astype(str)
-    .str.lower()
-    .isin(
-        [
-            "true",
-            "1",
-            "yes"
-        ]
+
+    if len(
+        stream.get(
+            "time_stamps",
+            [],
+        )
+    ) == 0:
+
+        raise RuntimeError(
+            f"XDF stream '{name}' contains no samples."
+        )
+
+    return stream
+
+
+def load_eeg_recording(
+    xdf_file: Path,
+) -> EEGRecording:
+    """
+    Load ATS_EEG_RAW and validate basic structure.
+    """
+
+    streams, _header = pyxdf.load_xdf(
+        str(
+            xdf_file
+        )
     )
 
-)
-
-
-valid_trials = (
-
-    validation[
-        validation[
-            "valid_bool"
-        ]
-    ]
-
-    .copy()
-
-    .reset_index(
-        drop=True
+    eeg_stream = require_stream(
+        build_stream_map(
+            streams
+        ),
+        EEG_STREAM_NAME,
     )
 
-)
-
-
-print(
-    "Total commanded trials:",
-    len(validation)
-)
-
-
-print(
-    "Valid behavioural trials:",
-    len(valid_trials)
-)
-
-
-print(
-    "Valid LEFT:",
-    sum(
-        valid_trials[
-            "side"
-        ] == "LEFT"
-    )
-)
-
-
-print(
-    "Valid RIGHT:",
-    sum(
-        valid_trials[
-            "side"
-        ] == "RIGHT"
-    )
-)
-
-
-print()
-
-
-if len(valid_trials) == 0:
-
-    raise RuntimeError(
-        "No valid trials available."
+    eeg = np.asarray(
+        eeg_stream[
+            "time_series"
+        ],
+        dtype=float,
     )
 
+    timestamps = np.asarray(
+        eeg_stream[
+            "time_stamps"
+        ],
+        dtype=float,
+    )
 
-# Save exact table that this analysis used.
+    if eeg.ndim != 2:
 
-VALID_USED_FILE = (
-    OUTPUT_DIR
-    /
-    "validated_trials_used.csv"
-)
+        raise RuntimeError(
+            f"Unexpected EEG array shape: {eeg.shape}"
+        )
 
+    if eeg.shape[0] != len(
+        timestamps
+    ):
 
-valid_trials.to_csv(
-    VALID_USED_FILE,
-    index=False
-)
+        raise RuntimeError(
+            "EEG sample count does not match timestamp count."
+        )
 
+    if eeg.shape[1] != len(
+        EEG_CHANNELS
+    ):
 
-# =========================================================
-# EXTRACT EEG
-# =========================================================
+        raise RuntimeError(
+            f"Expected {len(EEG_CHANNELS)} EEG channels "
+            f"({', '.join(EEG_CHANNELS)}), "
+            f"found {eeg.shape[1]}."
+        )
 
-eeg = np.asarray(
-    eeg_stream[
-        "time_series"
-    ],
-    dtype=float
-)
+    if len(
+        timestamps
+    ) < 2:
 
+        raise RuntimeError(
+            "At least two EEG timestamps are required."
+        )
 
-eeg_timestamps = np.asarray(
-    eeg_stream[
-        "time_stamps"
-    ],
-    dtype=float
-)
+    timestamp_deltas = np.diff(
+        timestamps
+    )
 
+    if np.any(
+        timestamp_deltas
+        <= 0
+    ):
 
-if eeg.ndim != 2:
+        raise RuntimeError(
+            "EEG timestamps are not strictly increasing."
+        )
 
-    raise RuntimeError(
-        "Unexpected EEG data shape."
+    observed_sfreq = float(
+        1.0
+        /
+        np.median(
+            timestamp_deltas
+        )
+    )
+
+    nominal_sfreq = float(
+        eeg_stream[
+            "info"
+        ][
+            "nominal_srate"
+        ][0]
+    )
+
+    sfreq = (
+        nominal_sfreq
+        if nominal_sfreq > 0
+        else observed_sfreq
+    )
+
+    return EEGRecording(
+        data_microvolts=eeg,
+        timestamps=timestamps,
+        sfreq=sfreq,
+        observed_sfreq=observed_sfreq,
     )
 
 
-if eeg.shape[1] != len(
-    EEG_CHANNELS
-):
+def parse_valid_boolean(
+    series: pd.Series,
+) -> pd.Series:
+    """
+    Interpret common representations of "True".
+    """
 
-    raise RuntimeError(
-        "Expected {} EEG channels, found {}.".format(
-            len(
-                EEG_CHANNELS
-            ),
-            eeg.shape[1]
+    return (
+        series
+        .astype(
+            str
+        )
+        .str.strip()
+        .str.lower()
+        .isin(
+            {
+                "true",
+                "1",
+                "yes",
+            }
         )
     )
 
 
-SFREQ = float(
-    eeg_stream[
-        "info"
-    ][
-        "nominal_srate"
-    ][0]
-)
+def load_validated_trials(
+    validation_csv: Path,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    """
+    Load validation output and return full table plus valid subset.
+    """
 
-
-print(
-    "EEG samples:",
-    eeg.shape[0]
-)
-
-
-print(
-    "EEG channels:",
-    eeg.shape[1]
-)
-
-
-print(
-    "Nominal EEG rate:",
-    SFREQ,
-    "Hz"
-)
-
-
-print()
-
-
-# =========================================================
-# CREATE MNE RAW
-# =========================================================
-
-# Cortex values stored in stream are microvolts but MNE expects volts.
-
-eeg_volts = (
-
-    eeg
-    /
-    1_000_000.0
-
-).T
-
-
-info = mne.create_info(
-    ch_names=EEG_CHANNELS,
-    sfreq=SFREQ,
-    ch_types="eeg"
-)
-
-
-raw = mne.io.RawArray(
-    eeg_volts,
-    info,
-    verbose=False
-)
-
-
-# =========================================================
-# ELECTRODE LOCATIONS
-# =========================================================
-
-montage = (
-    mne.channels.make_standard_montage(
-        "standard_1020"
+    validation = pd.read_csv(
+        validation_csv
     )
-)
+
+    required_columns = {
+        "trial",
+        "side",
+        "overall_valid",
+        "reaction_time",
+        "cue_time",
+        "movement_time",
+        "hold_time",
+        "rest_time",
+    }
+
+    missing = sorted(
+        required_columns
+        -
+        set(
+            validation.columns
+        )
+    )
+
+    if missing:
+
+        raise RuntimeError(
+            "Validation CSV is missing required columns: "
+            +
+            ", ".join(
+                missing
+            )
+        )
+
+    validation = validation.copy()
+
+    validation[
+        "valid_bool"
+    ] = parse_valid_boolean(
+        validation[
+            "overall_valid"
+        ]
+    )
+
+    valid_trials = (
+        validation[
+            validation[
+                "valid_bool"
+            ]
+        ]
+        .copy()
+        .reset_index(
+            drop=True
+        )
+    )
+
+    if len(
+        valid_trials
+    ) == 0:
+
+        raise RuntimeError(
+            "No behaviourally valid trials are available for EEG analysis."
+        )
+
+    valid_trials[
+        "side"
+    ] = (
+        valid_trials[
+            "side"
+        ]
+        .astype(
+            str
+        )
+        .str.strip()
+        .str.upper()
+    )
+
+    invalid_sides = sorted(
+        set(
+            valid_trials[
+                "side"
+            ]
+        )
+        -
+        set(
+            EVENT_ID
+        )
+    )
+
+    if invalid_sides:
+
+        raise RuntimeError(
+            "Validated trials contain unsupported side labels: "
+            +
+            ", ".join(
+                invalid_sides
+            )
+        )
+
+    numeric_columns = (
+        "trial",
+        "reaction_time",
+        "cue_time",
+        "movement_time",
+        "hold_time",
+        "rest_time",
+    )
+
+    for column in numeric_columns:
+
+        valid_trials[
+            column
+        ] = pd.to_numeric(
+            valid_trials[
+                column
+            ],
+            errors="coerce",
+        )
+
+    critical_columns = [
+        "trial",
+        "reaction_time",
+        "cue_time",
+        "movement_time",
+    ]
+
+    if (
+        valid_trials[
+            critical_columns
+        ]
+        .isna()
+        .any()
+        .any()
+    ):
+
+        raise RuntimeError(
+            "One or more valid trials contain missing or non-numeric trial, reaction_time, cue_time, or movement_time values."
+        )
+
+    return (
+        validation,
+        valid_trials,
+    )
 
 
-raw.set_montage(
-    montage,
-    on_missing="warn"
-)
+# ============================================================================
+# MNE PREPARATION
+# ============================================================================
 
 
-# =========================================================
-# FILTER EEG
-# =========================================================
+def create_filtered_raw(
+    recording: EEGRecording,
+) -> mne.io.RawArray:
+    """
+    Create MNE RawArray and apply analysis filters.
+    """
 
-print(
-    "Filtering EEG:"
-)
+    # ATS_EEG_RAW stores microvolts; MNE expects volts.
+    eeg_volts = (
+        recording.data_microvolts
+        /
+        1_000_000.0
+    ).T
+
+    info = mne.create_info(
+        ch_names=list(
+            EEG_CHANNELS
+        ),
+        sfreq=recording.sfreq,
+        ch_types="eeg",
+    )
+
+    raw = mne.io.RawArray(
+        eeg_volts,
+        info,
+        verbose=False,
+    )
+
+    montage = (
+        mne.channels.make_standard_montage(
+            "standard_1020"
+        )
+    )
+
+    raw.set_montage(
+        montage,
+        on_missing="warn",
+    )
+
+    filtered = raw.copy()
+
+    filtered.notch_filter(
+        freqs=[
+            NOTCH_FREQ
+        ],
+        picks="eeg",
+        verbose=False,
+    )
+
+    filtered.filter(
+        l_freq=FILTER_LOW,
+        h_freq=FILTER_HIGH,
+        picks="eeg",
+        verbose=False,
+    )
+
+    return filtered
 
 
-print(
-    "  notch:",
-    NOTCH_FREQ,
-    "Hz"
-)
+# ============================================================================
+# XDF EVENT -> EEG SAMPLE ALIGNMENT
+# ============================================================================
 
-
-print(
-    "  bandpass:",
-    FILTER_LOW,
-    "-",
-    FILTER_HIGH,
-    "Hz"
-)
-
-
-print()
-
-
-raw_filtered = raw.copy()
-
-
-raw_filtered.notch_filter(
-    freqs=[
-        NOTCH_FREQ
-    ],
-    picks="eeg",
-    verbose=False
-)
-
-
-raw_filtered.filter(
-    l_freq=FILTER_LOW,
-    h_freq=FILTER_HIGH,
-    picks="eeg",
-    verbose=False
-)
-
-
-# =========================================================
-# PRECISE XDF EVENT -> EEG SAMPLE MATCHING
-# =========================================================
 
 def nearest_eeg_sample(
-    event_time
-):
+    eeg_timestamps: np.ndarray,
+    event_time: float,
+) -> tuple[
+    int | None,
+    float | None,
+]:
     """
-    Find the actual EEG sample whose corrected XDF timestamp is closest to the event timestamp.
+    Find recorded EEG sample nearest to XDF event timestamp.
 
-    Better than simply multiplying elapsed time by 128 because the real stream is not perfectly periodic.
+    Deliberately uses the actual XDF timestamp sequence rather than:
+
+        sample_number = elapsed_time * nominal_sample_rate
+
+    Timing error returned:
+
+        nearest EEG timestamp - event timestamp
     """
 
-    insertion = np.searchsorted(
-        eeg_timestamps,
-        event_time
+    insertion = int(
+        np.searchsorted(
+            eeg_timestamps,
+            event_time,
+        )
     )
 
-
-    candidates = []
-
+    candidates: list[int] = []
 
     if insertion < len(
         eeg_timestamps
@@ -474,85 +598,84 @@ def nearest_eeg_sample(
             insertion
         )
 
-
     if insertion > 0:
 
         candidates.append(
             insertion - 1
         )
 
-
     if not candidates:
 
-        return None, None
-
-
-    best_index = min(
-
-        candidates,
-
-        key=lambda i: abs(
-            eeg_timestamps[i]
-            -
-            event_time
+        return (
+            None,
+            None,
         )
 
+    best_index = min(
+        candidates,
+        key=lambda index: abs(
+            eeg_timestamps[
+                index
+            ]
+            -
+            event_time
+        ),
     )
 
-
-    timing_error = (
-
+    timing_error = float(
         eeg_timestamps[
             best_index
         ]
         -
         event_time
-
     )
-
 
     return (
         best_index,
-        timing_error
+        timing_error,
     )
-
-
-# =========================================================
-# BUILD MNE EPOCHS
-# =========================================================
-
-EVENT_ID = {
-    "LEFT": 1,
-    "RIGHT": 2
-}
 
 
 def build_epochs(
-    alignment_name,
-    timestamp_column,
-    tmin,
-    tmax
-):
+    *,
+    raw_filtered: mne.io.RawArray,
+    eeg_timestamps: np.ndarray,
+    valid_trials: pd.DataFrame,
+    alignment_name: str,
+    timestamp_column: str,
+    tmin: float,
+    tmax: float,
+) -> EpochBuildResult:
     """
-    Build an MNE Epochs object using one timestamp column from the validated trial table.
+    Build MNE epochs from one event timestamp column.
     """
 
-    events = []
+    events: list[
+        list[int]
+    ] = []
 
-    metadata_rows = []
+    metadata_rows: list[
+        dict[str, object]
+    ] = []
 
-    timing_errors = []
-
+    timing_errors: list[
+        float
+    ] = []
 
     print()
+
     print(
-        "Building {}-aligned epochs...".format(
-            alignment_name
-        )
+        f"Building "
+        f"{alignment_name.lower()}-aligned epochs..."
     )
 
-
     for _, row in valid_trials.iterrows():
+
+        trial_number = int(
+            row[
+                "trial"
+            ]
+        )
 
         side = str(
             row[
@@ -560,101 +683,86 @@ def build_epochs(
             ]
         )
 
-
         event_time = float(
             row[
                 timestamp_column
             ]
         )
 
+        if not math.isfinite(
+            event_time
+        ):
 
-        # ---------------------------------------------
-        # Ensure complete epoch exists in XDF
-        # ---------------------------------------------
+            print(
+                f"Skipping trial {trial_number}: "
+                f"{timestamp_column} is not finite."
+            )
+
+            continue
 
         if (
-            event_time + tmin
+            event_time
+            + tmin
             <
             eeg_timestamps[0]
         ):
 
             print(
-                "Skipping trial {}: "
-                "too close to start.".format(
-                    row[
-                        "trial"
-                    ]
-                )
+                f"Skipping trial {trial_number}: "
+                "epoch extends before EEG recording start."
             )
 
             continue
 
-
         if (
-            event_time + tmax
+            event_time
+            + tmax
             >
             eeg_timestamps[-1]
         ):
 
             print(
-                "Skipping trial {}: "
-                "too close to end.".format(
-                    row[
-                        "trial"
-                    ]
-                )
+                f"Skipping trial {trial_number}: "
+                "epoch extends beyond EEG recording end."
             )
 
             continue
 
-
-        # ---------------------------------------------
-        # Timestamp -> actual EEG sample
-        # ---------------------------------------------
-
-        sample_index, error = (
-            nearest_eeg_sample(
-                event_time
-            )
+        (
+            sample_index,
+            timing_error,
+        ) = nearest_eeg_sample(
+            eeg_timestamps,
+            event_time,
         )
 
-
-        if sample_index is None:
+        if (
+            sample_index is None
+            or timing_error is None
+        ):
 
             continue
-
 
         timing_errors.append(
-            error
+            timing_error
         )
-
 
         events.append(
             [
                 int(
                     sample_index
                 ),
-
                 0,
-
                 EVENT_ID[
                     side
-                ]
+                ],
             ]
         )
 
-
         metadata_rows.append(
             {
-                "trial":
-                    int(
-                        row[
-                            "trial"
-                        ]
-                    ),
-
-                "side":
-                    side,
+                "trial": trial_number,
+                "side": side,
 
                 "reaction_time":
                     float(
@@ -690,43 +798,53 @@ def build_epochs(
 
                 "sample_timing_error_ms":
                     float(
-                        error
-                        *
-                        1000.0
-                    )
+                        timing_error
+                        * 1000.0
+                    ),
             }
         )
 
-
-    if len(events) == 0:
+    if not events:
 
         raise RuntimeError(
-            "No usable {} events.".format(
-                alignment_name
-            )
+            f"No usable "
+            f"{alignment_name.lower()} events were available."
         )
 
-
-    events = np.asarray(
+    events_array = np.asarray(
         events,
-        dtype=int
+        dtype=int,
     )
-
 
     metadata = pd.DataFrame(
         metadata_rows
     )
 
+    # Only include event IDs actually present in this epoch set.
+    # (To make analysis more robust to small, test, datasets; where one condition may be missing)
+    present_codes = set(
+        events_array[
+            :,
+            2
+        ]
+    )
+
+    present_event_id = {
+        side: code
+
+        for side, code
+        in EVENT_ID.items()
+
+        if code in present_codes
+    }
 
     epochs = mne.Epochs(
         raw_filtered,
+        events_array,
 
-        events,
-
-        event_id=EVENT_ID,
+        event_id=present_event_id,
 
         tmin=tmin,
-
         tmax=tmax,
 
         baseline=None,
@@ -737,309 +855,245 @@ def build_epochs(
 
         reject_by_annotation=True,
 
-        verbose=False
+        verbose=False,
     )
-
-
-    # ---------------------------------------------
-    # Timing check
-    # ---------------------------------------------
 
     timing_errors_ms = (
         np.asarray(
-            timing_errors
+            timing_errors,
+            dtype=float,
         )
         *
         1000.0
     )
 
+    print(
+        f"{len(epochs)} epochs created."
+    )
 
     print(
-        "{} epochs created.".format(
-            len(epochs)
+        "Mean absolute event/sample mismatch: "
+        f"{np.mean(np.abs(timing_errors_ms)):.3f} ms"
+    )
+
+    print(
+        "Worst absolute event/sample mismatch: "
+        f"{np.max(np.abs(timing_errors_ms)):.3f} ms"
+    )
+
+    return EpochBuildResult(
+        epochs=epochs,
+        timing_errors_ms=timing_errors_ms,
+    )
+
+
+# ============================================================================
+# PLOTTING HELPERS
+# ============================================================================
+
+
+def save_figure(
+    fig: plt.Figure,
+    path: Path,
+    show: bool,
+) -> None:
+    """
+    Save a figure and close it, unless interactive display requested.
+    """
+
+    fig.savefig(
+        path,
+        dpi=160,
+        bbox_inches="tight",
+    )
+
+    if not show:
+
+        plt.close(
+            fig
+        )
+
+
+def plot_reaction_times(
+    valid_trials: pd.DataFrame,
+    output_file: Path,
+    show: bool,
+) -> None:
+    """
+    Plot cue-to-movement reaction times, for valid trials.
+    """
+
+    trial_numbers = (
+        valid_trials[
+            "trial"
+        ]
+        .to_numpy(
+            dtype=int
         )
     )
 
-
-    print(
-        "Mean event/sample mismatch: "
-        "{:.3f} ms".format(
-            np.mean(
-                np.abs(
-                    timing_errors_ms
-                )
-            )
+    reaction_times = (
+        valid_trials[
+            "reaction_time"
+        ]
+        .to_numpy(
+            dtype=float
         )
     )
 
-
-    print(
-        "Worst event/sample mismatch: "
-        "{:.3f} ms".format(
-            np.max(
-                np.abs(
-                    timing_errors_ms
-                )
-            )
+    fig, ax = plt.subplots(
+        figsize=(
+            11,
+            5,
         )
     )
 
-
-    return epochs
-
-
-# =========================================================
-# CUE EPOCHS
-# =========================================================
-
-cue_epochs = build_epochs(
-    alignment_name="CUE",
-    timestamp_column="cue_time",
-    tmin=CUE_TMIN,
-    tmax=CUE_TMAX
-)
-
-
-# =========================================================
-# MOVEMENT EPOCHS
-# =========================================================
-
-movement_epochs = build_epochs(
-    alignment_name="MOVEMENT",
-    timestamp_column="movement_time",
-    tmin=MOVEMENT_TMIN,
-    tmax=MOVEMENT_TMAX
-)
-
-
-# =========================================================
-# SAVE MNE EPOCH FILES
-# =========================================================
-
-CUE_EPOCH_FILE = (
-    OUTPUT_DIR
-    /
-    "cue_aligned-epo.fif"
-)
-
-
-MOVEMENT_EPOCH_FILE = (
-    OUTPUT_DIR
-    /
-    "movement_aligned-epo.fif"
-)
-
-
-cue_epochs.save(
-    CUE_EPOCH_FILE,
-    overwrite=True
-)
-
-
-movement_epochs.save(
-    MOVEMENT_EPOCH_FILE,
-    overwrite=True
-)
-
-
-print()
-print(
-    "Saved cue epochs:"
-)
-
-print(
-    CUE_EPOCH_FILE
-)
-
-
-print()
-print(
-    "Saved movement epochs:"
-)
-
-print(
-    MOVEMENT_EPOCH_FILE
-)
-
-
-# =========================================================
-# REACTION TIME PLOT
-# =========================================================
-
-fig, ax = plt.subplots(
-    figsize=(
-        11,
-        5
+    ax.scatter(
+        trial_numbers,
+        reaction_times,
+        s=80,
     )
-)
 
-
-trial_numbers = valid_trials[
-    "trial"
-].to_numpy()
-
-
-reaction_times = valid_trials[
-    "reaction_time"
-].to_numpy(
-    dtype=float
-)
-
-
-ax.scatter(
-    trial_numbers,
-    reaction_times,
-    s=80
-)
-
-
-for trial, side, reaction in zip(
-    trial_numbers,
-    valid_trials[
-        "side"
-    ],
-    reaction_times
-):
-
-    ax.text(
+    for (
         trial,
-        reaction + 0.025,
         side,
-        ha="center",
-        fontsize=9
-    )
+        reaction,
+    ) in zip(
+        trial_numbers,
+        valid_trials[
+            "side"
+        ],
+        reaction_times,
+    ):
 
+        ax.text(
+            trial,
+            reaction + 0.025,
+            side,
+            ha="center",
+            fontsize=9,
+        )
 
-ax.axhline(
-    np.mean(
-        reaction_times
-    ),
-    linestyle="--",
-    alpha=0.7,
-    label=(
-        "Mean = {:.3f} s".format(
-            np.mean(
-                reaction_times
-            )
+    reaction_mean = float(
+        np.mean(
+            reaction_times
         )
     )
-)
+
+    ax.axhline(
+        reaction_mean,
+        linestyle="--",
+        alpha=0.7,
+        label=(
+            f"Mean = "
+            f"{reaction_mean:.3f} s"
+        ),
+    )
+
+    ax.set_title(
+        "ATS Motor Experiment — Valid Trial Reaction Times"
+    )
+
+    ax.set_xlabel(
+        "Trial"
+    )
+
+    ax.set_ylabel(
+        "Cue → movement onset (s)"
+    )
+
+    ax.grid(
+        alpha=0.25
+    )
+
+    ax.legend()
+
+    fig.tight_layout()
+
+    save_figure(
+        fig,
+        output_file,
+        show,
+    )
 
 
-ax.set_title(
-    "ATS Motor Experiment — Valid Trial Reaction Times"
-)
+def baseline_corrected_microvolts(
+    epochs: mne.Epochs,
+) -> np.ndarray:
+    """
+    Apply configured baseline and return EEG in mV
+    """
 
-
-ax.set_xlabel(
-    "Trial"
-)
-
-
-ax.set_ylabel(
-    "Cue → movement onset (s)"
-)
-
-
-ax.grid(
-    alpha=0.25
-)
-
-
-ax.legend()
-
-
-fig.tight_layout()
-
-
-fig.savefig(
-    OUTPUT_DIR
-    /
-    "01_reaction_times.png",
-    dpi=160
-)
-
-
-# =========================================================
-# BASELINE-CORRECTED EEG WAVEFORMS
-# =========================================================
-
-def get_baseline_corrected_data(
-    epochs
-):
-
-    corrected = epochs.copy()
-
+    corrected = (
+        epochs.copy()
+    )
 
     corrected.apply_baseline(
         (
             BASELINE_START,
-            BASELINE_END
+            BASELINE_END,
         )
     )
 
-
-    # Convert V -> µV for display.
     return (
-
         corrected.get_data()
         *
         1_000_000.0
-
     )
 
 
-# =========================================================
-# LEFT vs RIGHT AVERAGE EEG
-# =========================================================
-
 def plot_condition_averages(
-    epochs,
-    title,
-    filename,
-    zero_label
-):
+    *,
+    epochs: mne.Epochs,
+    title: str,
+    output_file: Path,
+    zero_label: str,
+    show: bool,
+) -> None:
+    """
+    Plot LEFT / RIGHT, baseline-corrected, average EEG.
+    """
 
     times = epochs.times
-
 
     fig, axes = plt.subplots(
         len(
             EEG_CHANNELS
         ),
         1,
+
         figsize=(
             13,
-            12
+            12,
         ),
-        sharex=True
-    )
 
+        sharex=True,
+    )
 
     for channel_index, (
         channel,
-        ax
+        ax,
     ) in enumerate(
         zip(
             EEG_CHANNELS,
-            axes
+            axes,
         )
     ):
 
-        for side in [
+        plotted = False
+
+        for side in (
             "LEFT",
-            "RIGHT"
-        ]:
+            "RIGHT",
+        ):
 
             if side not in epochs.event_id:
 
                 continue
 
-
             side_epochs = epochs[
                 side
             ]
-
 
             if len(
                 side_epochs
@@ -1047,177 +1101,127 @@ def plot_condition_averages(
 
                 continue
 
-
             data = (
-                get_baseline_corrected_data(
+                baseline_corrected_microvolts(
                     side_epochs
                 )
             )
-
 
             average = np.mean(
                 data[
                     :,
                     channel_index,
-                    :
+                    :,
                 ],
-                axis=0
+                axis=0,
             )
-
 
             ax.plot(
                 times,
                 average,
                 label=(
-                    "{} (n={})".format(
-                        side,
-                        len(
-                            side_epochs
-                        )
-                    )
-                )
+                    f"{side} "
+                    f"(n={len(side_epochs)})"
+                ),
             )
 
+            plotted = True
 
         ax.axvline(
             0.0,
             linestyle="--",
-            alpha=0.7
+            alpha=0.7,
         )
-
 
         ax.axhline(
             0.0,
             linewidth=0.7,
-            alpha=0.4
+            alpha=0.4,
         )
-
 
         ax.set_ylabel(
-            "{}\nµV".format(
-                channel
-            )
+            f"{channel}\nµV"
         )
-
 
         ax.grid(
             alpha=0.20
         )
 
+        if plotted:
 
-        ax.legend(
-            loc="upper right"
-        )
-
+            ax.legend(
+                loc="upper right"
+            )
 
     axes[-1].set_xlabel(
-        "Time relative to {} (s)".format(
-            zero_label
-        )
+        f"Time relative to {zero_label} (s)"
     )
-
 
     fig.suptitle(
         title,
-        fontsize=16
+        fontsize=16,
     )
-
 
     fig.tight_layout(
         rect=[
             0,
             0,
             1,
-            0.97
+            0.97,
         ]
     )
 
-
-    fig.savefig(
-        OUTPUT_DIR
-        /
-        filename,
-        dpi=160
+    save_figure(
+        fig,
+        output_file,
+        show,
     )
 
 
-# =========================================================
-# CUE-ALIGNED AVERAGE
-# =========================================================
+# ============================================================================
+# POWER SPECTRAL DENSITY
+# ============================================================================
 
-plot_condition_averages(
-    cue_epochs,
-
-    title=(
-        "Cue-Aligned EEG — LEFT vs RIGHT"
-    ),
-
-    filename=(
-        "02_cue_aligned_average_eeg.png"
-    ),
-
-    zero_label="cue"
-)
-
-
-# =========================================================
-# MOVEMENT-ALIGNED AVERAGE
-# =========================================================
-
-plot_condition_averages(
-    movement_epochs,
-
-    title=(
-        "Movement-Onset-Aligned EEG — LEFT vs RIGHT"
-    ),
-
-    filename=(
-        "03_movement_aligned_average_eeg.png"
-    ),
-
-    zero_label="movement onset"
-)
-
-
-# =========================================================
-# PSD
-# =========================================================
 
 def calculate_psd(
-    epochs
-):
+    epochs: mne.Epochs,
+    sfreq: float,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+]:
+    """
+    Calculate Welch PSD for every epoch and EEG channel.
+    """
 
-    data = epochs.get_data()
-
+    data = (
+        epochs.get_data()
+    )
 
     nperseg = min(
         256,
-        data.shape[-1]
+        data.shape[-1],
     )
-
 
     freqs, power = welch(
         data,
-        fs=SFREQ,
+        fs=sfreq,
         nperseg=nperseg,
-        axis=-1
+        axis=-1,
     )
 
-
-    # V²/Hz -> µV²/Hz
+    # V² / Hz -> µV² / Hz
     power = (
         power
         *
         1e12
     )
 
-
     keep = (
-        (freqs >= 2.0)
+        (freqs >= PSD_LOW)
         &
-        (freqs <= 40.0)
+        (freqs <= PSD_HIGH)
     )
-
 
     return (
         freqs[
@@ -1227,34 +1231,49 @@ def calculate_psd(
         power[
             ...,
             keep
-        ]
+        ],
     )
 
 
-def plot_psd():
+def plot_movement_psd(
+    *,
+    movement_epochs: mne.Epochs,
+    sfreq: float,
+    output_file: Path,
+    show: bool,
+) -> None:
+    """
+    Plot movement-aligned LEFT / RIGHT EEG PSD.
+    """
 
     fig, axes = plt.subplots(
         len(
             EEG_CHANNELS
         ),
         1,
+
         figsize=(
             12,
-            12
+            12,
         ),
-        sharex=True
+
+        sharex=True,
     )
 
+    plotted = False
 
-    for side in [
+    for side in (
         "LEFT",
-        "RIGHT"
-    ]:
+        "RIGHT",
+    ):
+
+        if side not in movement_epochs.event_id:
+
+            continue
 
         side_epochs = movement_epochs[
             side
         ]
-
 
         if len(
             side_epochs
@@ -1262,20 +1281,20 @@ def plot_psd():
 
             continue
 
-
-        freqs, power = calculate_psd(
-            side_epochs
+        (
+            freqs,
+            power,
+        ) = calculate_psd(
+            side_epochs,
+            sfreq,
         )
-
 
         mean_power = np.mean(
             power,
-            axis=0
+            axis=0,
         )
 
-
         db_power = (
-
             10.0
             *
             np.log10(
@@ -1283,9 +1302,7 @@ def plot_psd():
                 +
                 1e-20
             )
-
         )
-
 
         for channel_index, ax in enumerate(
             axes
@@ -1293,99 +1310,93 @@ def plot_psd():
 
             ax.plot(
                 freqs,
+
                 db_power[
                     channel_index
                 ],
+
                 label=(
-                    "{} (n={})".format(
-                        side,
-                        len(
-                            side_epochs
-                        )
-                    )
-                )
+                    f"{side} "
+                    f"(n={len(side_epochs)})"
+                ),
             )
 
+        plotted = True
 
     for channel, ax in zip(
         EEG_CHANNELS,
-        axes
+        axes,
     ):
 
         ax.set_ylabel(
-            "{}\ndB".format(
-                channel
-            )
+            f"{channel}\ndB"
         )
-
 
         ax.grid(
             alpha=0.20
         )
 
+        if plotted:
 
-        ax.legend(
-            loc="upper right"
-        )
-
+            ax.legend(
+                loc="upper right"
+            )
 
     axes[-1].set_xlabel(
         "Frequency (Hz)"
     )
 
-
     fig.suptitle(
-        "Movement-Aligned EEG Power Spectral Density",
-        fontsize=16
+        "Movement-Aligned EEG-Power Spectral Density",
+        fontsize=16,
     )
-
 
     fig.tight_layout(
         rect=[
             0,
             0,
             1,
-            0.97
+            0.97,
         ]
     )
 
-
-    fig.savefig(
-        OUTPUT_DIR
-        /
-        "04_movement_psd.png",
-        dpi=160
+    save_figure(
+        fig,
+        output_file,
+        show,
     )
 
 
-plot_psd()
-
-
-# =========================================================
+# ============================================================================
 # TIME-FREQUENCY / ERD-ERS
-# =========================================================
+# ============================================================================
+
 
 def calculate_erds(
-    epochs
-):
+    epochs: mne.Epochs,
+    sfreq: float,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+]:
     """
-    Calculate Morlet power for every epoch independently, baseline-normalise each trial, then average.
+    Calculate trial-wise baseline-normalised Morlet power.
 
-    Output is percentage power change relative to baseline:
-
-        0%     = baseline power
-        <0%    = desynchronisation / reduced power
-        >0%    = synchronisation / increased power
+    Output:
+        0%   = baseline power
+        <0%  = reduced power / desynchronisation
+        >0%  = increased power / synchronisation
     """
 
-    data = epochs.get_data()
-
+    data = (
+        epochs.get_data()
+    )
 
     power = (
         mne.time_frequency.tfr_array_morlet(
             data,
 
-            sfreq=SFREQ,
+            sfreq=sfreq,
 
             freqs=TFR_FREQS,
 
@@ -1397,84 +1408,92 @@ def calculate_erds(
 
             n_jobs=1,
 
-            verbose=False
+            verbose=False,
         )
     )
 
-
     times = epochs.times
 
-
     baseline_mask = (
-
         (times >= BASELINE_START)
-
         &
-
         (times <= BASELINE_END)
-
     )
 
+    if not np.any(
+        baseline_mask
+    ):
+
+        raise RuntimeError(
+            "Configured ERD/ERS baseline is outside the epoch window."
+        )
 
     baseline_power = np.mean(
         power[
             ...,
-            baseline_mask
+            baseline_mask,
         ],
+
         axis=-1,
-        keepdims=True
+
+        keepdims=True,
     )
 
-
-    # Avoid division by zero.
+    # Avoid divide-by-zero instability.
     baseline_power = np.maximum(
         baseline_power,
-        1e-30
+        1e-30,
     )
 
-
     erds = (
-
         (
             power
             -
             baseline_power
         )
-
         /
         baseline_power
-
         *
         100.0
-
     )
 
-
-    # Average across trials.
     average_erds = np.mean(
         erds,
-        axis=0
+        axis=0,
     )
-
 
     return (
         times,
-        average_erds
+        average_erds,
     )
 
 
 def plot_tfr_condition(
-    epochs,
-    side,
-    alignment_name,
-    zero_label,
-    filename
-):
+    *,
+    epochs: mne.Epochs,
+    sfreq: float,
+    side: str,
+    alignment_name: str,
+    zero_label: str,
+    output_file: Path,
+    show: bool,
+) -> None:
+    """
+    Plot one condition's channel-wise ERD/ERS maps.
+    """
+
+    if side not in epochs.event_id:
+
+        print(
+            f"Skipping {alignment_name} {side} TFR: "
+            "no epochs for this condition."
+        )
+
+        return
 
     side_epochs = epochs[
         side
     ]
-
 
     if len(
         side_epochs
@@ -1482,67 +1501,62 @@ def plot_tfr_condition(
 
         return
 
-
     print(
-        "Calculating {} {} TFR "
-        "(n={})...".format(
-            alignment_name,
-            side,
-            len(
-                side_epochs
-            )
+        f"Calculating "
+        f"{alignment_name} {side} TFR "
+        f"(n={len(side_epochs)})..."
+    )
+
+    (
+        times,
+        erds,
+    ) = calculate_erds(
+        side_epochs,
+        sfreq,
+    )
+
+    # Shared robust colour scale across all channels within this figure.
+    robust_limit = float(
+        np.nanpercentile(
+            np.abs(
+                erds
+            ),
+            97,
         )
     )
 
-
-    times, erds = calculate_erds(
-        side_epochs
-    )
-
-
-    # Use a shared scale across channels within this figure.
-    robust_limit = np.nanpercentile(
-        np.abs(
-            erds
-        ),
-        97
-    )
-
-
     robust_limit = max(
         robust_limit,
-        1.0
+        1.0,
     )
-
 
     fig, axes = plt.subplots(
         len(
             EEG_CHANNELS
         ),
         1,
+
         figsize=(
             13,
-            15
+            15,
         ),
-        sharex=True
-    )
 
+        sharex=True,
+    )
 
     image = None
 
-
     for channel_index, (
         channel,
-        ax
+        ax,
     ) in enumerate(
         zip(
             EEG_CHANNELS,
-            axes
+            axes,
         )
     ):
 
         image = ax.imshow(
-
             erds[
                 channel_index
             ],
@@ -1555,335 +1569,829 @@ def plot_tfr_condition(
                 times[0],
                 times[-1],
                 TFR_FREQS[0],
-                TFR_FREQS[-1]
+                TFR_FREQS[-1],
             ],
 
             cmap="RdBu_r",
 
             vmin=-robust_limit,
-
-            vmax=robust_limit
+            vmax=robust_limit,
         )
-
 
         ax.axvline(
             0.0,
             linestyle="--",
-            linewidth=1.2
+            linewidth=1.2,
         )
-
 
         ax.set_ylabel(
-            "{}\nHz".format(
-                channel
-            )
+            f"{channel}\nHz"
         )
-
 
     axes[-1].set_xlabel(
-        "Time relative to {} (s)".format(
-            zero_label
-        )
+        f"Time relative to {zero_label} (s)"
     )
-
 
     fig.suptitle(
-        "{}-Aligned {} ERD/ERS — n={}".format(
-            alignment_name,
-            side,
-            len(
-                side_epochs
-            )
-        ),
-        fontsize=16
+        f"{alignment_name}-Aligned {side} ERD/ERS "
+        f"— n={len(side_epochs)}",
+
+        fontsize=16,
     )
 
+    if image is not None:
 
-    colorbar = fig.colorbar(
-        image,
-        ax=axes,
-        pad=0.015
-    )
+        colorbar = fig.colorbar(
+            image,
+            ax=axes,
+            pad=0.015,
+        )
 
-
-    colorbar.set_label(
-        "Power change from baseline (%)"
-    )
-
+        colorbar.set_label(
+            "Power change from baseline (%)"
+        )
 
     fig.subplots_adjust(
         left=0.10,
         right=0.88,
         bottom=0.06,
         top=0.94,
-        hspace=0.18
+        hspace=0.18,
+    )
+
+    save_figure(
+        fig,
+        output_file,
+        show,
     )
 
 
-    fig.savefig(
-        OUTPUT_DIR
+# ============================================================================
+# SUMMARY
+# ============================================================================
+
+
+def write_summary(
+    *,
+    output_file: Path,
+    xdf_file: Path,
+    validation_csv: Path,
+    validation: pd.DataFrame,
+    valid_trials: pd.DataFrame,
+    recording: EEGRecording,
+    cue_timing_errors_ms: np.ndarray,
+    movement_timing_errors_ms: np.ndarray,
+) -> None:
+    """
+    Write concise summary without exposing machine-specific paths.
+    """
+
+    reaction_times = (
+        valid_trials[
+            "reaction_time"
+        ]
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+    left_count = int(
+        np.sum(
+            valid_trials[
+                "side"
+            ]
+            ==
+            "LEFT"
+        )
+    )
+
+    right_count = int(
+        np.sum(
+            valid_trials[
+                "side"
+            ]
+            ==
+            "RIGHT"
+        )
+    )
+
+    with output_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        file.write(
+            "ATS VALIDATED MOTOR EEG ANALYSIS\n"
+        )
+
+        file.write(
+            "================================\n\n"
+        )
+
+        # Filenames only (safe to publish without exposing local paths):
+        file.write(
+            f"XDF source: {xdf_file.name}\n"
+        )
+
+        file.write(
+            f"Validation source: "
+            f"{validation_csv.name}\n\n"
+        )
+
+        file.write(
+            f"Total commanded trials: "
+            f"{len(validation)}\n"
+        )
+
+        file.write(
+            f"Valid trials: "
+            f"{len(valid_trials)}\n"
+        )
+
+        file.write(
+            f"Valid LEFT: "
+            f"{left_count}\n"
+        )
+
+        file.write(
+            f"Valid RIGHT: "
+            f"{right_count}\n"
+        )
+
+        file.write(
+            "\nReaction time mean: "
+            f"{np.mean(reaction_times):.4f} s\n"
+        )
+
+        file.write(
+            "Reaction time SD: "
+            f"{np.std(reaction_times):.4f} s\n"
+        )
+
+        file.write(
+            "Reaction time min: "
+            f"{np.min(reaction_times):.4f} s\n"
+        )
+
+        file.write(
+            "Reaction time max: "
+            f"{np.max(reaction_times):.4f} s\n"
+        )
+
+        file.write(
+            "\nEEG nominal sample rate: "
+            f"{recording.sfreq:.4f} Hz\n"
+        )
+
+        file.write(
+            "EEG median timestamp-derived rate: "
+            f"{recording.observed_sfreq:.4f} Hz\n"
+        )
+
+        file.write(
+            "\nEEG filtering: "
+            f"{FILTER_LOW:.1f}-{FILTER_HIGH:.1f} Hz\n"
+        )
+
+        file.write(
+            f"Notch: "
+            f"{NOTCH_FREQ:.1f} Hz\n"
+        )
+
+        file.write(
+            "\nCue event/sample mean absolute mismatch: "
+            f"{np.mean(np.abs(cue_timing_errors_ms)):.3f} ms\n"
+        )
+
+        file.write(
+            "Cue event/sample worst absolute mismatch: "
+            f"{np.max(np.abs(cue_timing_errors_ms)):.3f} ms\n"
+        )
+
+        file.write(
+            "Movement event/sample mean absolute mismatch: "
+            f"{np.mean(np.abs(movement_timing_errors_ms)):.3f} ms\n"
+        )
+
+        file.write(
+            "Movement event/sample worst absolute mismatch: "
+            f"{np.max(np.abs(movement_timing_errors_ms)):.3f} ms\n"
+        )
+
+        file.write(
+            "\nIMPORTANT:\n"
+            "This analysis is exploratory. "
+            "Behavioural validation does not constitute "
+            "EEG artefact rejection.\n"
+        )
+
+
+# ============================================================================
+# COMMAND LINE
+# ============================================================================
+
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse analysis command-line arguments.
+    """
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Analyse behaviourally validated "
+            "ATS motor-response EEG trials."
+        )
+    )
+
+    parser.add_argument(
+        "xdf",
+        type=Path,
+        help=(
+            "Multimodal XDF recording."
+        ),
+    )
+
+    parser.add_argument(
+        "validation_csv",
+        type=Path,
+        nargs="?",
+        default=None,
+        help=(
+            "Validation CSV. "
+            "If omitted, defaults to "
+            "<xdf_stem>_validated_trials.csv "
+            "beside the XDF."
+        ),
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Analysis output directory. "
+            "Defaults to <xdf_stem>_analysis "
+            "beside the XDF."
+        ),
+    )
+
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help=(
+            "Display saved figures "
+            "interactively at the end."
+        ),
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+
+def main() -> None:
+
+    args = parse_args()
+
+    xdf_file = (
+        args.xdf
+        .expanduser()
+        .resolve()
+    )
+
+    if not xdf_file.is_file():
+
+        raise FileNotFoundError(
+            f"XDF file not found: "
+            f"{xdf_file}"
+        )
+
+    validation_csv = (
+        args.validation_csv
+        .expanduser()
+        .resolve()
+
+        if args.validation_csv is not None
+
+        else xdf_file.with_name(
+            xdf_file.stem
+            +
+            "_validated_trials.csv"
+        )
+    )
+
+    if not validation_csv.is_file():
+
+        raise FileNotFoundError(
+            f"Validation CSV not found: "
+            f"{validation_csv}\n"
+            "Run validation/validate_motor_trials.py "
+            "first or provide the validation CSV explicitly."
+        )
+
+    output_dir = (
+        args.output_dir
+        .expanduser()
+        .resolve()
+
+        if args.output_dir is not None
+
+        else xdf_file.with_name(
+            xdf_file.stem
+            +
+            "_analysis"
+        )
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print()
+    print(
+        "========================================"
+    )
+    print(
+        " ATS VALIDATED MOTOR EEG ANALYSIS"
+    )
+    print(
+        "========================================"
+    )
+    print()
+
+    print(
+        f"XDF:        {xdf_file}"
+    )
+
+    print(
+        f"Validation: {validation_csv}"
+    )
+
+    print(
+        f"Output:     {output_dir}"
+    )
+
+    print()
+
+    # ----------------------------------------------------------------------
+    # Load inputs
+    # ----------------------------------------------------------------------
+
+    print(
+        "Loading EEG from XDF..."
+    )
+
+    recording = load_eeg_recording(
+        xdf_file
+    )
+
+    print(
+        f"EEG samples:             "
+        f"{recording.data_microvolts.shape[0]}"
+    )
+
+    print(
+        f"EEG channels:            "
+        f"{recording.data_microvolts.shape[1]}"
+    )
+
+    print(
+        f"Nominal analysis rate:   "
+        f"{recording.sfreq:.4f} Hz"
+    )
+
+    print(
+        f"Median timestamp rate:   "
+        f"{recording.observed_sfreq:.4f} Hz"
+    )
+
+    print()
+
+    (
+        validation,
+        valid_trials,
+    ) = load_validated_trials(
+        validation_csv
+    )
+
+    left_count = int(
+        np.sum(
+            valid_trials[
+                "side"
+            ]
+            ==
+            "LEFT"
+        )
+    )
+
+    right_count = int(
+        np.sum(
+            valid_trials[
+                "side"
+            ]
+            ==
+            "RIGHT"
+        )
+    )
+
+    print(
+        f"Total commanded trials:   "
+        f"{len(validation)}"
+    )
+
+    print(
+        f"Valid behavioural trials: "
+        f"{len(valid_trials)}"
+    )
+
+    print(
+        f"Valid LEFT:               "
+        f"{left_count}"
+    )
+
+    print(
+        f"Valid RIGHT:              "
+        f"{right_count}"
+    )
+
+    valid_trials.to_csv(
+        output_dir
         /
-        filename,
-        dpi=160
+        "validated_trials_used.csv",
+
+        index=False,
     )
 
+    # ----------------------------------------------------------------------
+    # Filter and epoch
+    # ----------------------------------------------------------------------
 
-# =========================================================
-# CUE TFR
-# =========================================================
+    print()
 
-plot_tfr_condition(
-    cue_epochs,
-    side="LEFT",
-    alignment_name="Cue",
-    zero_label="cue",
-    filename="05_cue_tfr_LEFT.png"
-)
-
-
-plot_tfr_condition(
-    cue_epochs,
-    side="RIGHT",
-    alignment_name="Cue",
-    zero_label="cue",
-    filename="06_cue_tfr_RIGHT.png"
-)
-
-
-# =========================================================
-# MOVEMENT TFR
-# =========================================================
-
-plot_tfr_condition(
-    movement_epochs,
-    side="LEFT",
-    alignment_name="Movement",
-    zero_label="movement onset",
-    filename="07_movement_tfr_LEFT.png"
-)
-
-
-plot_tfr_condition(
-    movement_epochs,
-    side="RIGHT",
-    alignment_name="Movement",
-    zero_label="movement onset",
-    filename="08_movement_tfr_RIGHT.png"
-)
-
-
-# =========================================================
-# SUMMARY FILE
-# =========================================================
-
-SUMMARY_FILE = (
-    OUTPUT_DIR
-    /
-    "analysis_summary.txt"
-)
-
-
-with open(
-    SUMMARY_FILE,
-    "w",
-    encoding="utf-8"
-) as file:
-
-    file.write(
-        "ATS VALIDATED MOTOR EEG ANALYSIS\n"
+    print(
+        f"Filtering EEG: "
+        f"{FILTER_LOW:.1f}-{FILTER_HIGH:.1f} Hz, "
+        f"{NOTCH_FREQ:.1f} Hz notch"
     )
 
-    file.write(
-        "================================\n\n"
+    raw_filtered = create_filtered_raw(
+        recording
     )
 
+    cue_result = build_epochs(
+        raw_filtered=raw_filtered,
 
-    file.write(
-        "XDF:\n{}\n\n".format(
-            XDF_FILE
-        )
+        eeg_timestamps=
+            recording.timestamps,
+
+        valid_trials=
+            valid_trials,
+
+        alignment_name=
+            "CUE",
+
+        timestamp_column=
+            "cue_time",
+
+        tmin=
+            CUE_TMIN,
+
+        tmax=
+            CUE_TMAX,
     )
 
+    movement_result = build_epochs(
+        raw_filtered=raw_filtered,
 
-    file.write(
-        "Total commanded trials: {}\n".format(
-            len(
-                validation
-            )
-        )
+        eeg_timestamps=
+            recording.timestamps,
+
+        valid_trials=
+            valid_trials,
+
+        alignment_name=
+            "MOVEMENT",
+
+        timestamp_column=
+            "movement_time",
+
+        tmin=
+            MOVEMENT_TMIN,
+
+        tmax=
+            MOVEMENT_TMAX,
     )
 
-
-    file.write(
-        "Valid trials: {}\n".format(
-            len(
-                valid_trials
-            )
-        )
+    cue_epochs = (
+        cue_result.epochs
     )
 
-
-    file.write(
-        "Valid LEFT: {}\n".format(
-            sum(
-                valid_trials[
-                    "side"
-                ]
-                ==
-                "LEFT"
-            )
-        )
+    movement_epochs = (
+        movement_result.epochs
     )
 
+    cue_epochs.save(
+        output_dir
+        /
+        "cue_aligned-epo.fif",
 
-    file.write(
-        "Valid RIGHT: {}\n".format(
-            sum(
-                valid_trials[
-                    "side"
-                ]
-                ==
-                "RIGHT"
-            )
-        )
+        overwrite=True,
     )
 
+    movement_epochs.save(
+        output_dir
+        /
+        "movement_aligned-epo.fif",
 
-    file.write(
-        "\nReaction time mean: {:.4f} s\n".format(
-            np.mean(
-                reaction_times
-            )
-        )
+        overwrite=True,
     )
 
+    # ----------------------------------------------------------------------
+    # Figures
+    # ----------------------------------------------------------------------
 
-    file.write(
-        "Reaction time SD: {:.4f} s\n".format(
-            np.std(
-                reaction_times
-            )
-        )
+    print()
+    print(
+        "Generating figures..."
     )
 
+    plot_reaction_times(
+        valid_trials,
 
-    file.write(
-        "Reaction time min: {:.4f} s\n".format(
-            np.min(
-                reaction_times
-            )
-        )
+        output_dir
+        /
+        "01_reaction_times.png",
+
+        args.show,
     )
 
+    plot_condition_averages(
+        epochs=
+            cue_epochs,
 
-    file.write(
-        "Reaction time max: {:.4f} s\n".format(
-            np.max(
-                reaction_times
-            )
-        )
+        title=
+            "Cue-Aligned EEG — LEFT vs RIGHT",
+
+        output_file=
+            output_dir
+            /
+            "02_cue_aligned_eeg.png",
+
+        zero_label=
+            "cue",
+
+        show=
+            args.show,
     )
 
+    plot_condition_averages(
+        epochs=
+            movement_epochs,
 
-    file.write(
-        "\nEEG filtering: {:.1f}-{:.1f} Hz\n".format(
-            FILTER_LOW,
-            FILTER_HIGH
-        )
+        title=
+            "Movement-Onset-Aligned EEG — LEFT vs RIGHT",
+
+        output_file=
+            output_dir
+            /
+            "03_movement_aligned_eeg.png",
+
+        zero_label=
+            "movement onset",
+
+        show=
+            args.show,
     )
 
+    plot_movement_psd(
+        movement_epochs=
+            movement_epochs,
 
-    file.write(
-        "Notch: {:.1f} Hz\n".format(
-            NOTCH_FREQ
-        )
+        sfreq=
+            recording.sfreq,
+
+        output_file=
+            output_dir
+            /
+            "04_movement_psd.png",
+
+        show=
+            args.show,
     )
 
+    plot_tfr_condition(
+        epochs=
+            cue_epochs,
 
-    file.write(
-        "\nIMPORTANT:\n"
-        "This analysis is exploratory. "
-        "Behavioural validation does not constitute "
-        "EEG artefact rejection.\n"
+        sfreq=
+            recording.sfreq,
+
+        side=
+            "LEFT",
+
+        alignment_name=
+            "Cue",
+
+        zero_label=
+            "cue",
+
+        output_file=
+            output_dir
+            /
+            "05_cue_tfr_left.png",
+
+        show=
+            args.show,
     )
 
+    plot_tfr_condition(
+        epochs=
+            cue_epochs,
 
-print()
-print("========================================")
-print(" ANALYSIS COMPLETE")
-print("========================================")
-print()
+        sfreq=
+            recording.sfreq,
+
+        side=
+            "RIGHT",
+
+        alignment_name=
+            "Cue",
+
+        zero_label=
+            "cue",
+
+        output_file=
+            output_dir
+            /
+            "06_cue_tfr_right.png",
+
+        show=
+            args.show,
+    )
+
+    plot_tfr_condition(
+        epochs=
+            movement_epochs,
+
+        sfreq=
+            recording.sfreq,
+
+        side=
+            "LEFT",
+
+        alignment_name=
+            "Movement",
+
+        zero_label=
+            "movement onset",
+
+        output_file=
+            output_dir
+            /
+            "07_movement_tfr_left.png",
+
+        show=
+            args.show,
+    )
+
+    plot_tfr_condition(
+        epochs=
+            movement_epochs,
+
+        sfreq=
+            recording.sfreq,
+
+        side=
+            "RIGHT",
+
+        alignment_name=
+            "Movement",
+
+        zero_label=
+            "movement onset",
+
+        output_file=
+            output_dir
+            /
+            "08_movement_tfr_right.png",
+
+        show=
+            args.show,
+    )
+
+    # ----------------------------------------------------------------------
+    # Summary
+    # ----------------------------------------------------------------------
+
+    write_summary(
+        output_file=
+            output_dir
+            /
+            "analysis_summary.txt",
+
+        xdf_file=
+            xdf_file,
+
+        validation_csv=
+            validation_csv,
+
+        validation=
+            validation,
+
+        valid_trials=
+            valid_trials,
+
+        recording=
+            recording,
+
+        cue_timing_errors_ms=
+            cue_result.timing_errors_ms,
+
+        movement_timing_errors_ms=
+            movement_result.timing_errors_ms,
+    )
+
+    print()
+    print(
+        "========================================"
+    )
+    print(
+        " ANALYSIS COMPLETE"
+    )
+    print(
+        "========================================"
+    )
+    print()
+
+    print(
+        f"Output folder: "
+        f"{output_dir}"
+    )
+
+    print()
+
+    print(
+        "Generated:"
+    )
+
+    print(
+        "  validated_trials_used.csv"
+    )
+
+    print(
+        "  cue_aligned-epo.fif"
+    )
+
+    print(
+        "  movement_aligned-epo.fif"
+    )
+
+    print(
+        "  01_reaction_times.png"
+    )
+
+    print(
+        "  02_cue_aligned_eeg.png"
+    )
+
+    print(
+        "  03_movement_aligned_eeg.png"
+    )
+
+    print(
+        "  04_movement_psd.png"
+    )
+
+    print(
+        "  05_cue_tfr_left.png"
+    )
+
+    print(
+        "  06_cue_tfr_right.png"
+    )
+
+    print(
+        "  07_movement_tfr_left.png"
+    )
+
+    print(
+        "  08_movement_tfr_right.png"
+    )
+
+    print(
+        "  analysis_summary.txt"
+    )
+
+    print()
+
+    if args.show:
+
+        plt.show()
 
 
-print(
-    "Output folder:"
-)
-
-print(
-    OUTPUT_DIR
-)
-
-
-print()
-
-
-print(
-    "Generated:"
-)
-
-print(
-    "  validated_trials_used.csv"
-)
-
-print(
-    "  cue_aligned-epo.fif"
-)
-
-print(
-    "  movement_aligned-epo.fif"
-)
-
-print(
-    "  01_reaction_times.png"
-)
-
-print(
-    "  02_cue_aligned_average_eeg.png"
-)
-
-print(
-    "  03_movement_aligned_average_eeg.png"
-)
-
-print(
-    "  04_movement_psd.png"
-)
-
-print(
-    "  05_cue_tfr_LEFT.png"
-)
-
-print(
-    "  06_cue_tfr_RIGHT.png"
-)
-
-print(
-    "  07_movement_tfr_LEFT.png"
-)
-
-print(
-    "  08_movement_tfr_RIGHT.png"
-)
-
-print(
-    "  analysis_summary.txt"
-)
-
-
-print()
-print(
-    "Opening figures..."
-)
-
-
-plt.show()
+if __name__ == "__main__":
+    main()
