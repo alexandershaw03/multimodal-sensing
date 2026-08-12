@@ -1,25 +1,17 @@
 """
-Plot synchronised multimodal ATS neural-motor XDF recording.
+Plot synchronised multimodal neural-motor XDF recording.
 
-Visualisation combines:
-    ATS_EEG_RAW - Five-channel EEG.
-and
-    ATS_BODY_POSE - Vision-derived upper-body kinematics.
-and
-    ATS_MARKERS - Manual (experimental) annotations.
-and
-    ATS_VISION_EVENTS - Automatically detected movement events.
+The visualisation combines:
+    ATS_EEG_RAW      - five-channel EEG
+    ATS_BODY_POSE    - vision-derived upper-body kinematics
+    ATS_EXPERIMENT   - automatic experiment markers, when present
+    ATS_MARKERS      - manual markers, used as a fallback
+    ATS_VISION_EVENTS - automatically detected vision events
 
-All streams plotted on a common timeline, referenced to the first recorded EEG sample.
-Resulting figure, therefore, provides a compact view of the relationship between:
+All streams are plotted on a common timeline referenced to the first recorded EEG sample.
 
-    neural activity
-        ↕
-    physical movement
-        ↕
-    manually generated events
-        ↕
-    vision-derived events
+The pose reader is schema-aware. 
+It first attempts to recover channel labels from XDF/LSL metadata, falling back to the known ATS V1 (24 channel) or V2 (32 channel) layouts when metadata is unavailable.
 
 Usage
 -----
@@ -49,7 +41,10 @@ import pyxdf
 
 EEG_STREAM_NAME = "ATS_EEG_RAW"
 POSE_STREAM_NAME = "ATS_BODY_POSE"
+
+EXPERIMENT_STREAM_NAME = "ATS_EXPERIMENT"
 MANUAL_STREAM_NAME = "ATS_MARKERS"
+
 VISION_STREAM_NAME = "ATS_VISION_EVENTS"
 
 
@@ -62,46 +57,58 @@ EEG_CHANNELS = (
 )
 
 
-POSE_CHANNELS = (
+POSE_CHANNELS_V1 = (
     "L_SHOULDER_X",
     "L_SHOULDER_Y",
-
     "L_ELBOW_X",
     "L_ELBOW_Y",
-
     "L_WRIST_X",
     "L_WRIST_Y",
-
     "R_SHOULDER_X",
     "R_SHOULDER_Y",
-
     "R_ELBOW_X",
     "R_ELBOW_Y",
-
     "R_WRIST_X",
     "R_WRIST_Y",
-
     "L_ELBOW_ANGLE",
     "R_ELBOW_ANGLE",
-
     "L_WRIST_REL_X",
     "L_WRIST_REL_Y",
-
     "R_WRIST_REL_X",
     "R_WRIST_REL_Y",
-
     "L_WRIST_SPEED",
     "R_WRIST_SPEED",
-
     "L_WINDOW_TRAVEL",
     "R_WINDOW_TRAVEL",
-
     "SHOULDER_WIDTH",
     "POSENET_FPS",
 )
 
 
-# Preserve spacing used by original visualisation.
+POSE_CHANNELS_V2 = (
+    *POSE_CHANNELS_V1,
+    "L_NEUTRAL_DISTANCE",
+    "R_NEUTRAL_DISTANCE",
+    "L_TRIAL_PEAK_DISTANCE",
+    "R_TRIAL_PEAK_DISTANCE",
+    "L_TRIAL_ACTIVE",
+    "R_TRIAL_ACTIVE",
+    "L_TRIAL_READY",
+    "R_TRIAL_READY",
+)
+
+
+REQUIRED_POSE_CHANNELS = (
+    "L_WRIST_REL_Y",
+    "R_WRIST_REL_Y",
+    "L_WRIST_SPEED",
+    "R_WRIST_SPEED",
+    "L_ELBOW_ANGLE",
+    "R_ELBOW_ANGLE",
+)
+
+
+# preserve spacing used by original visualisation.
 DEFAULT_EEG_SPACING = 600.0
 
 
@@ -110,19 +117,13 @@ DEFAULT_EEG_SPACING = 600.0
 # ============================================================================
 
 
-def stream_name(
-    stream: dict,
-) -> str:
+def stream_name(stream: dict) -> str:
     """Return LSL stream name stored in XDF stream."""
 
-    return str(
-        stream["info"]["name"][0]
-    )
+    return str(stream["info"]["name"][0])
 
 
-def build_stream_map(
-    streams: list[dict],
-) -> dict[str, dict]:
+def build_stream_map(streams: list[dict]) -> dict[str, dict]:
     """Index XDF streams by LSL stream name."""
 
     return {
@@ -138,9 +139,7 @@ def require_stream(
     """Return required XDF stream or raise useful error."""
 
     if name not in stream_map:
-        available = ", ".join(
-            sorted(stream_map)
-        )
+        available = ", ".join(sorted(stream_map))
 
         raise RuntimeError(
             f"Required XDF stream '{name}' was not found.\n"
@@ -149,12 +148,7 @@ def require_stream(
 
     stream = stream_map[name]
 
-    if len(
-        stream.get(
-            "time_stamps",
-            [],
-        )
-    ) == 0:
+    if len(stream.get("time_stamps", [])) == 0:
         raise RuntimeError(
             f"XDF stream '{name}' contains no samples."
         )
@@ -162,9 +156,57 @@ def require_stream(
     return stream
 
 
-def decode_marker(
-    value,
-) -> str:
+def select_experiment_stream(
+    stream_map: dict[str, dict],
+) -> tuple[dict, str, str]:
+    """
+    Select experiment/annotation event stream.
+
+    ATS_EXPERIMENT preferred, because it's produced by the current automatic motor-task application. 
+    ATS_MARKERS is retained as a backwards-compatible fallback, for earlier/manual recordings.
+
+    Returns
+    -------
+    stream - Selected XDF stream.
+    row_label - Human-readable label for the event timeline.
+    stream_name_value - LSL name of the selected stream.
+    """
+
+    if EXPERIMENT_STREAM_NAME in stream_map:
+        stream = require_stream(
+            stream_map,
+            EXPERIMENT_STREAM_NAME,
+        )
+
+        return (
+            stream,
+            "Experiment",
+            EXPERIMENT_STREAM_NAME,
+        )
+
+    if MANUAL_STREAM_NAME in stream_map:
+        stream = require_stream(
+            stream_map,
+            MANUAL_STREAM_NAME,
+        )
+
+        return (
+            stream,
+            "Manual",
+            MANUAL_STREAM_NAME,
+        )
+
+    available = ", ".join(sorted(stream_map))
+
+    raise RuntimeError(
+        "No experiment/annotation marker stream was found.\n"
+        f"Expected '{EXPERIMENT_STREAM_NAME}' or "
+        f"'{MANUAL_STREAM_NAME}'.\n"
+        f"Available streams: {available or 'none'}"
+    )
+
+
+def decode_marker(value) -> str:
     """Decode marker value into normal Python string."""
 
     if isinstance(value, bytes):
@@ -176,10 +218,8 @@ def decode_marker(
     return str(value)
 
 
-def first_channel_values(
-    stream: dict,
-) -> list[str]:
-    """Extract and decode the first channel of a marker stream."""
+def first_channel_values(stream: dict) -> list[str]:
+    """Extract and decode first channel of marker stream."""
 
     values = []
 
@@ -189,12 +229,133 @@ def first_channel_values(
             continue
 
         values.append(
-            decode_marker(
-                sample[0]
-            )
+            decode_marker(sample[0])
         )
 
     return values
+
+
+def _first_text(value) -> str | None:
+    """Return first string-like value, from nested XDF metadata."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, bytes):
+        return value.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            text = _first_text(item)
+
+            if text:
+                return text
+
+        return None
+
+    return str(value)
+
+
+def pose_channel_labels_from_metadata(
+    pose_stream: dict,
+) -> list[str]:
+    """
+    Recover channel labels from LSL metadata stored in XDF (pyxdf represents XML metadata hierarchy as nested dictionaries and lists). 
+    ATS_BODY_POSE writes labels under:
+        info -> desc -> channels -> channel -> label
+    """
+
+    try:
+        desc = pose_stream["info"]["desc"][0]
+        channels_container = desc["channels"][0]
+        channel_entries = channels_container["channel"]
+
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+    ):
+        return []
+
+    labels = []
+
+    for channel in channel_entries:
+        if not isinstance(channel, dict):
+            return []
+
+        label = _first_text(
+            channel.get("label")
+        )
+
+        if not label:
+            return []
+
+        labels.append(label)
+
+    return labels
+
+
+def resolve_pose_channel_labels(
+    pose_stream: dict,
+    channel_count: int,
+) -> tuple[str, ...]:
+    """
+    Determine pose schema used by recording.
+
+    Metadata is preferred because they make the reader, independent of column position. 
+    Known ATS layouts are used only as a compatibility fallback, for recordings without usable channel metadata.
+    """
+
+    metadata_labels = pose_channel_labels_from_metadata(
+        pose_stream
+    )
+
+    if metadata_labels:
+        if len(metadata_labels) != channel_count:
+            raise RuntimeError(
+                "ATS_BODY_POSE metadata channel-label count "
+                f"({len(metadata_labels)}) does not match recorded "
+                f"data width ({channel_count})."
+            )
+
+        if len(set(metadata_labels)) != len(
+            metadata_labels
+        ):
+            raise RuntimeError(
+                "ATS_BODY_POSE contains duplicate channel labels in XDF metadata."
+            )
+
+        return tuple(metadata_labels)
+
+    if channel_count == len(POSE_CHANNELS_V1):
+        print(
+            "Pose metadata labels unavailable; "
+            "using known ATS_BODY_POSE V1 24-channel layout."
+        )
+
+        return POSE_CHANNELS_V1
+
+    if channel_count == len(POSE_CHANNELS_V2):
+        print(
+            "Pose metadata labels unavailable; "
+            "using known ATS_BODY_POSE V2 32-channel layout."
+        )
+
+        return POSE_CHANNELS_V2
+
+    raise RuntimeError(
+        "Could not determine ATS_BODY_POSE channel layout. "
+        f"Recording contains {channel_count} channels, "
+        f"while known fallback layouts contain "
+        f"{len(POSE_CHANNELS_V1)} and "
+        f"{len(POSE_CHANNELS_V2)} channels."
+    )
 
 
 # ============================================================================
@@ -206,9 +367,7 @@ def relative_times(
     stream: dict,
     reference_time: float,
 ) -> np.ndarray:
-    """
-    Convert XDF stream's timestamps to seconds, relative to reference.
-    """
+    """Convert XDF timestamps to seconds, relative to reference."""
 
     return (
         np.asarray(
@@ -225,7 +384,7 @@ def time_mask(
     start: float | None,
     end: float | None,
 ) -> np.ndarray:
-    """Return a mask for optional relative-time display window."""
+    """Return mask for optional, relative-time display window."""
 
     mask = np.ones(
         len(timestamps),
@@ -233,18 +392,10 @@ def time_mask(
     )
 
     if start is not None:
-        mask &= (
-            timestamps
-            >=
-            start
-        )
+        mask &= timestamps >= start
 
     if end is not None:
-        mask &= (
-            timestamps
-            <=
-            end
-        )
+        mask &= timestamps <= end
 
     return mask
 
@@ -262,7 +413,7 @@ def extract_eeg(
     np.ndarray,
 ]:
     """
-    Extract five-channel EEG and remove channel means (for display only).
+    Extract five-channel EEG and remove channel means (for display only)
     """
 
     eeg = np.asarray(
@@ -280,23 +431,19 @@ def extract_eeg(
             f"Unexpected EEG array shape: {eeg.shape}"
         )
 
-    if eeg.shape[0] != len(
-        timestamps
-    ):
+    if eeg.shape[0] != len(timestamps):
         raise RuntimeError(
             "EEG sample count does not match timestamp count."
         )
 
-    if eeg.shape[1] != len(
-        EEG_CHANNELS
-    ):
+    if eeg.shape[1] != len(EEG_CHANNELS):
         raise RuntimeError(
             f"Expected {len(EEG_CHANNELS)} EEG channels "
             f"({', '.join(EEG_CHANNELS)}), "
             f"found {eeg.shape[1]}."
         )
 
-    # Display-only centring (raw, recorded values are not modified).
+    # Display-only centring (recorded values not modified)
     eeg_display = (
         eeg
         -
@@ -319,8 +466,9 @@ def extract_pose(
     np.ndarray,
     np.ndarray,
     dict[str, int],
+    tuple[str, ...],
 ]:
-    """Extract and validate body-pose stream."""
+    """Extract body-pose stream and resolve channel schema."""
 
     pose = np.asarray(
         pose_stream["time_series"],
@@ -337,33 +485,39 @@ def extract_pose(
             f"Unexpected pose array shape: {pose.shape}"
         )
 
-    if pose.shape[0] != len(
-        timestamps
-    ):
+    if pose.shape[0] != len(timestamps):
         raise RuntimeError(
             "Pose sample count does not match timestamp count."
         )
 
-    if pose.shape[1] != len(
-        POSE_CHANNELS
-    ):
-        raise RuntimeError(
-            f"Expected {len(POSE_CHANNELS)} pose channels, "
-            f"found {pose.shape[1]}."
-        )
+    channel_labels = resolve_pose_channel_labels(
+        pose_stream,
+        pose.shape[1],
+    )
 
     channel_index = {
         channel: index
         for index, channel
-        in enumerate(
-            POSE_CHANNELS
-        )
+        in enumerate(channel_labels)
     }
+
+    missing = [
+        channel
+        for channel in REQUIRED_POSE_CHANNELS
+        if channel not in channel_index
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "ATS_BODY_POSE is missing channels required by this visualisation: "
+            + ", ".join(missing)
+        )
 
     return (
         pose,
         timestamps,
         channel_index,
+        channel_labels,
     )
 
 
@@ -373,6 +527,11 @@ def pose_channel(
     name: str,
 ) -> np.ndarray:
     """Return one named-pose channel."""
+
+    if name not in channel_index:
+        raise KeyError(
+            f"Pose channel '{name}' is not present."
+        )
 
     return pose[
         :,
@@ -403,9 +562,7 @@ def extract_events(
         stream
     )
 
-    if len(values) != len(
-        timestamps
-    ):
+    if len(values) != len(timestamps):
         raise RuntimeError(
             f"Event count mismatch in stream "
             f"'{stream_name(stream)}'."
@@ -430,7 +587,7 @@ def draw_event_row(
     *,
     show_labels: bool,
 ) -> None:
-    """Draw one row of event markers."""
+    """Draws one row of event markers"""
 
     ax.scatter(
         timestamps,
@@ -462,18 +619,16 @@ def draw_event_row(
 
 def draw_event_lines(
     axes: list[plt.Axes],
-    manual_times: np.ndarray,
+    experiment_times: np.ndarray,
     vision_times: np.ndarray,
 ) -> None:
     """
-    Draw event timestamps through all continuous-signal plots.
-
-    Manual events = dashed lines
-
-    Vision events = dotted lines
+    Draw event timestamps, through all continuous-signal plots:
+    Experiment/manual events  = dashed lines.
+    Vision events             = dotted lines.
     """
 
-    for timestamp in manual_times:
+    for timestamp in experiment_times:
         for ax in axes:
             ax.axvline(
                 timestamp,
@@ -504,8 +659,9 @@ def create_multimodal_figure(
     pose: np.ndarray,
     pose_time: np.ndarray,
     pose_index: dict[str, int],
-    manual_time: np.ndarray,
-    manual_labels: list[str],
+    experiment_time: np.ndarray,
+    experiment_labels: list[str],
+    experiment_row_label: str,
     vision_time: np.ndarray,
     vision_labels: list[str],
     eeg_spacing: float,
@@ -696,15 +852,15 @@ def create_multimodal_figure(
 
     ax_events.set_yticklabels(
         [
-            "Manual",
+            experiment_row_label,
             "Vision",
         ]
     )
 
     draw_event_row(
         ax_events,
-        manual_time,
-        manual_labels,
+        experiment_time,
+        experiment_labels,
         0.0,
         show_labels=show_event_labels,
     )
@@ -732,7 +888,7 @@ def create_multimodal_figure(
             ax_speed,
             ax_angle,
         ],
-        manual_time,
+        experiment_time,
         vision_time,
     )
 
@@ -814,7 +970,7 @@ def parse_args() -> argparse.Namespace:
         "--no-event-labels",
         action="store_true",
         help=(
-            "Hide vertical event text labels while retaining event points and timing lines."
+            "Hide vertical event text labels, while retaining event points and timing lines."
         ),
     )
 
@@ -822,7 +978,7 @@ def parse_args() -> argparse.Namespace:
         "--show",
         action="store_true",
         help=(
-            "Display the figure interactively after saving."
+            "Display figure interactively after saving."
         ),
     )
 
@@ -886,6 +1042,7 @@ def main() -> None:
     print(" ATS MULTIMODAL XDF PLOT")
     print("========================================")
     print()
+
     print(f"Loading: {xdf_file}")
     print()
 
@@ -894,9 +1051,7 @@ def main() -> None:
     # ----------------------------------------------------------------------
 
     streams, _header = pyxdf.load_xdf(
-        str(
-            xdf_file
-        )
+        str(xdf_file)
     )
 
     stream_map = build_stream_map(
@@ -905,9 +1060,7 @@ def main() -> None:
 
     print("Streams:")
 
-    for name in sorted(
-        stream_map
-    ):
+    for name in sorted(stream_map):
         print(
             f"  {name:<22} "
             f"{len(stream_map[name]['time_stamps'])} samples"
@@ -925,9 +1078,12 @@ def main() -> None:
         POSE_STREAM_NAME,
     )
 
-    manual_stream = require_stream(
-        stream_map,
-        MANUAL_STREAM_NAME,
+    (
+        experiment_stream,
+        experiment_row_label,
+        experiment_stream_name,
+    ) = select_experiment_stream(
+        stream_map
     )
 
     vision_stream = require_stream(
@@ -955,16 +1111,17 @@ def main() -> None:
         pose,
         pose_time,
         pose_index,
+        pose_labels,
     ) = extract_pose(
         pose_stream,
         reference_time,
     )
 
     (
-        manual_time,
-        manual_labels,
+        experiment_time,
+        experiment_labels,
     ) = extract_events(
-        manual_stream,
+        experiment_stream,
         reference_time,
     )
 
@@ -992,8 +1149,8 @@ def main() -> None:
         args.end,
     )
 
-    manual_keep = time_mask(
-        manual_time,
+    experiment_keep = time_mask(
+        experiment_time,
         args.start,
         args.end,
     )
@@ -1020,16 +1177,16 @@ def main() -> None:
         pose_keep
     ]
 
-    manual_time = manual_time[
-        manual_keep
+    experiment_time = experiment_time[
+        experiment_keep
     ]
 
-    manual_labels = [
+    experiment_labels = [
         label
         for label, keep
         in zip(
-            manual_labels,
-            manual_keep,
+            experiment_labels,
+            experiment_keep,
         )
         if keep
     ]
@@ -1063,19 +1220,28 @@ def main() -> None:
     # ----------------------------------------------------------------------
 
     print(
-        f"EEG samples plotted:      {len(eeg_time)}"
+        f"Pose schema:             {len(pose_labels)} channels"
     )
 
     print(
-        f"Pose samples plotted:     {len(pose_time)}"
+        f"Event stream:            {experiment_stream_name}"
     )
 
     print(
-        f"Manual events plotted:    {len(manual_time)}"
+        f"EEG samples plotted:     {len(eeg_time)}"
     )
 
     print(
-        f"Vision events plotted:    {len(vision_time)}"
+        f"Pose samples plotted:    {len(pose_time)}"
+    )
+
+    print(
+        f"{experiment_row_label} events plotted: "
+        f"{len(experiment_time)}"
+    )
+
+    print(
+        f"Vision events plotted:   {len(vision_time)}"
     )
 
     print()
@@ -1087,19 +1253,15 @@ def main() -> None:
     figure = create_multimodal_figure(
         eeg=eeg,
         eeg_time=eeg_time,
-
         pose=pose,
         pose_time=pose_time,
         pose_index=pose_index,
-
-        manual_time=manual_time,
-        manual_labels=manual_labels,
-
+        experiment_time=experiment_time,
+        experiment_labels=experiment_labels,
+        experiment_row_label=experiment_row_label,
         vision_time=vision_time,
         vision_labels=vision_labels,
-
         eeg_spacing=args.eeg_spacing,
-
         show_event_labels=(
             not args.no_event_labels
         ),
@@ -1112,7 +1274,7 @@ def main() -> None:
     )
 
     print(
-        f"Saved:\n{output_file}"
+        f"Saved: {output_file}"
     )
 
     if args.show:
