@@ -1,0 +1,21 @@
+# Multimodal Neural-Motor Sensing
+# Python dependencies
+
+# Numerical processing
+numpy
+scipy
+pandas
+
+# EEG / biosignal analysis
+mne
+
+# Lab Streaming Layer / XDF
+pylsl
+pyxdf
+
+# Plotting
+matplotlib
+
+# Emotiv Cortex interface
+requests
+websocket-client
