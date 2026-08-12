@@ -1,118 +1,406 @@
-import pyxdf
+"""
+Inspect contents of an XDF recording.
+Used for providing a quick diagnostic summary of all streams in an XDF file, including: sample count; duration; nominal rate; timestamp-derived rate.
+
+ATS EEG and marker streams receive additional content checks.
+
+Usage
+-----
+python tools/inspect_xdf.py recording.xdf
+"""
+
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
 
+import numpy as np
+import pyxdf
 
-# ---------------------------------------------------------
-# CHANGE THIS TO YOUR XDF FILE
-# ---------------------------------------------------------
 
-# Change "xxx"'s to actual file path
-XDF_FILE = Path(
-    r" xxx "
+EEG_STREAM_NAME = "ATS_EEG_RAW"
+MARKER_STREAM_NAME = "ATS_MARKERS"
+
+EEG_CHANNELS = (
+    "AF3",
+    "T7",
+    "Pz",
+    "T8",
+    "AF4",
 )
 
 
-print("\n========================================")
-print(" ATS XDF INSPECTOR")
-print("========================================\n")
+def decode_value(value) -> str:
+    """Decode XDF string value."""
 
-print(f"Loading:\n{XDF_FILE}\n")
+    if isinstance(value, bytes):
+        return value.decode(
+            "utf-8",
+            errors="replace",
+        )
 
-streams, header = pyxdf.load_xdf(str(XDF_FILE))
-
-print(f"Found {len(streams)} stream(s).\n")
+    return str(value)
 
 
-for i, stream in enumerate(streams, start=1):
+def get_stream_name(
+    stream: dict,
+) -> str:
+    """Return XDF stream's LSL name."""
 
-    info = stream["info"]
+    return str(
+        stream["info"]["name"][0]
+    )
 
-    name = info["name"][0]
-    stream_type = info["type"][0]
 
-    samples = stream["time_series"]
-    timestamps = stream["time_stamps"]
+def get_stream_type(
+    stream: dict,
+) -> str:
+    """Return XDF stream's LSL type."""
+
+    return str(
+        stream["info"]["type"][0]
+    )
+
+
+def nominal_rate(
+    stream: dict,
+) -> float:
+    """Read stream's declared nominal sampling rate."""
+
+    try:
+        return float(
+            stream["info"]["nominal_srate"][0]
+        )
+
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ):
+        return 0.0
+
+
+def measured_rate(
+    timestamps: np.ndarray,
+) -> float | None:
+    """Estimate rate from recorded timestamp sequence."""
+
+    if len(timestamps) < 2:
+        return None
+
+    duration = float(
+        timestamps[-1]
+        -
+        timestamps[0]
+    )
+
+    if duration <= 0:
+        return None
+
+    return float(
+        (len(timestamps) - 1)
+        /
+        duration
+    )
+
+
+def print_stream_summary(
+    stream: dict,
+    index: int,
+) -> None:
+    """Print general information about one XDF stream."""
+
+    name = get_stream_name(
+        stream
+    )
+
+    stream_type = get_stream_type(
+        stream
+    )
+
+    samples = np.asarray(
+        stream["time_series"]
+    )
+
+    timestamps = np.asarray(
+        stream["time_stamps"],
+        dtype=float,
+    )
 
     print("----------------------------------------")
-    print(f"STREAM {i}")
+    print(f"STREAM {index}")
     print("----------------------------------------")
 
-    print(f"Name:        {name}")
-    print(f"Type:        {stream_type}")
-    print(f"Samples:     {len(samples)}")
+    print(f"Name:          {name}")
+    print(f"Type:          {stream_type}")
+    print(f"Samples:       {len(samples)}")
+    print(f"Data shape:    {samples.shape}")
+
+    declared_rate = nominal_rate(
+        stream
+    )
+
+    declared_text = (
+        f"{declared_rate:.3f} Hz"
+        if declared_rate > 0
+        else "irregular"
+    )
+
+    print(
+        f"Nominal rate:  {declared_text}"
+    )
 
     if len(timestamps) > 0:
-        duration = timestamps[-1] - timestamps[0]
+        duration = float(
+            timestamps[-1]
+            -
+            timestamps[0]
+        )
 
-        print(f"Duration:    {duration:.3f} seconds")
+        print(
+            f"Duration:      {duration:.3f} s"
+        )
 
-        if duration > 0 and len(samples) > 1:
-            measured_rate = (len(samples) - 1) / duration
-            print(f"Actual rate: {measured_rate:.2f} Hz")
+        rate = measured_rate(
+            timestamps
+        )
+
+        if rate is not None:
+            print(
+                f"Measured rate: {rate:.3f} Hz"
+            )
+
+        print(
+            f"First time:    {timestamps[0]:.6f}"
+        )
+
+        print(
+            f"Last time:     {timestamps[-1]:.6f}"
+        )
 
     print()
 
 
-print("========================================")
-print(" STREAM CONTENT CHECK")
-print("========================================\n")
+def inspect_eeg(
+    stream: dict,
+) -> None:
+    """Display quick ATS_EEG content-check."""
 
+    eeg = np.asarray(
+        stream["time_series"],
+        dtype=float,
+    )
 
-for stream in streams:
+    print("ATS_EEG_RAW")
+    print("-----------")
 
-    name = stream["info"]["name"][0]
+    print(
+        f"Shape: {eeg.shape}"
+    )
 
-    # -----------------------------------------------------
-    # EEG
-    # -----------------------------------------------------
+    if len(eeg) == 0:
+        print("No EEG samples.")
+        print()
+        return
 
-    if name == "ATS_EEG_RAW":
-
-        eeg = stream["time_series"]
-
-        print("ATS_EEG_RAW:")
-        print(f"  Shape: {eeg.shape}")
-
-        if len(eeg) > 0:
-            print("  First EEG sample:")
-            print(f"    AF3 = {eeg[0][0]}")
-            print(f"    T7  = {eeg[0][1]}")
-            print(f"    Pz  = {eeg[0][2]}")
-            print(f"    T8  = {eeg[0][3]}")
-            print(f"    AF4 = {eeg[0][4]}")
+    if (
+        eeg.ndim != 2
+        or eeg.shape[1] != len(EEG_CHANNELS)
+    ):
+        print(
+            "WARNING: EEG dimensions do not match the expected five-channel Insight layout."
+        )
 
         print()
+        return
 
-    # -----------------------------------------------------
-    # MARKERS
-    # -----------------------------------------------------
+    print("First sample:")
 
-    elif name == "ATS_MARKERS":
+    for channel, value in zip(
+        EEG_CHANNELS,
+        eeg[0],
+    ):
+        print(
+            f"  {channel:<3} = {value:.3f}"
+        )
 
-        markers = stream["time_series"]
-        timestamps = stream["time_stamps"]
+    print()
 
-        print("ATS_MARKERS:")
+    print("Per-channel range:")
 
-        if len(markers) == 0:
-            print("  No markers found.")
+    for channel_index, channel in enumerate(
+        EEG_CHANNELS
+    ):
+        values = eeg[
+            :,
+            channel_index
+        ]
 
-        else:
+        print(
+            f"  {channel:<3} "
+            f"{np.nanmin(values):10.3f} "
+            f"to "
+            f"{np.nanmax(values):10.3f}"
+        )
 
-            first_time = timestamps[0]
+    print()
 
-            for marker, timestamp in zip(markers, timestamps):
 
-                relative_time = timestamp - first_time
+def inspect_markers(
+    stream: dict,
+) -> None:
+    """Display all manual markers."""
 
-                print(
-                    f"  +{relative_time:8.3f}s"
-                    f"   {marker[0]}"
-                )
+    markers = stream[
+        "time_series"
+    ]
 
+    timestamps = np.asarray(
+        stream["time_stamps"],
+        dtype=float,
+    )
+
+    print("ATS_MARKERS")
+    print("-----------")
+
+    if len(markers) == 0:
+        print("No markers found.")
         print()
+        return
+
+    recording_reference = float(
+        timestamps[0]
+    )
+
+    for sample, timestamp in zip(
+        markers,
+        timestamps,
+    ):
+        value = (
+            sample[0]
+            if len(sample)
+            else ""
+        )
+
+        relative_time = (
+            float(timestamp)
+            -
+            recording_reference
+        )
+
+        print(
+            f"  +{relative_time:9.3f} s   "
+            f"{decode_value(value)}"
+        )
+
+    print()
 
 
-print("========================================")
-print(" DONE")
-print("========================================")
+def parse_args() -> argparse.Namespace:
+    """Parse XDF inspector arguments."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Inspect streams and contents inside XDF recording."
+        )
+    )
+
+    parser.add_argument(
+        "xdf",
+        type=Path,
+        help="XDF file to inspect.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    xdf_file = (
+        args.xdf
+        .expanduser()
+        .resolve()
+    )
+
+    if not xdf_file.is_file():
+        raise FileNotFoundError(
+            f"XDF file not found: {xdf_file}"
+        )
+
+    print()
+    print("========================================")
+    print(" ATS XDF INSPECTOR")
+    print("========================================")
+    print()
+
+    print(
+        f"Loading:\n{xdf_file}"
+    )
+    print()
+
+    streams, _header = pyxdf.load_xdf(
+        str(
+            xdf_file
+        )
+    )
+
+    print(
+        f"Found {len(streams)} stream"
+        f"{'' if len(streams) == 1 else 's'}."
+    )
+
+    print()
+
+    for index, stream in enumerate(
+        streams,
+        start=1,
+    ):
+        print_stream_summary(
+            stream,
+            index,
+        )
+
+    print("========================================")
+    print(" ATS CONTENT CHECKS")
+    print("========================================")
+    print()
+
+    stream_map = {
+        get_stream_name(stream): stream
+        for stream in streams
+    }
+
+    if EEG_STREAM_NAME in stream_map:
+        inspect_eeg(
+            stream_map[
+                EEG_STREAM_NAME
+            ]
+        )
+
+    else:
+        print(
+            f"{EEG_STREAM_NAME}: not present.\n"
+        )
+
+    if MARKER_STREAM_NAME in stream_map:
+        inspect_markers(
+            stream_map[
+                MARKER_STREAM_NAME
+            ]
+        )
+
+    else:
+        print(
+            f"{MARKER_STREAM_NAME}: not present.\n"
+        )
+
+    print("========================================")
+    print(" DONE")
+    print("========================================")
+    print()
+
+
+if __name__ == "__main__":
+    main()
