@@ -17,5 +17,5 @@ pyxdf
 matplotlib
 
 # Emotiv Cortex interface
-requests
 websocket-client
+python-dotenv
