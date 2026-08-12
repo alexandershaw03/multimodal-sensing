@@ -97,10 +97,10 @@ def print_streams(streams) -> None:
             else "irregular"
         )
 
-            hostname = (
-                stream.hostname()
-                or "unknown"
-            )
+        hostname = (
+            stream.hostname()
+            or "unknown"
+        )
 
         print(
             f"{stream.name():<24}"
