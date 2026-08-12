@@ -1,8 +1,7 @@
 ATS VALIDATED MOTOR EEG ANALYSIS
 ================================
 
-XDF:
-C:\Users\Alexander Shaw\ATS_Multimodal\ xxx.xdf
+Representative exploratory motor-response recording.
 
 Total commanded trials: 6
 Valid trials: 4
@@ -18,4 +17,4 @@ EEG filtering: 1.0-40.0 Hz
 Notch: 50.0 Hz
 
 IMPORTANT:
-This analysis is exploratory. Behavioural validation does not constitute EEG artefact rejection.
+This analysis is exploratory. Behavioural validation does not constitute EEG as artefact rejection.
