@@ -216,3 +216,157 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+
+# =============================================================================
+# ATS Multimodal Neural-Motor Sensing — project-specific ignores
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Secrets / credentials
+# -----------------------------------------------------------------------------
+
+# Local environment files containing API keys or credentials
+.env
+.env.*
+!.env.example
+
+# Common local credential files
+credentials.json
+secrets.json
+token.json
+credentials.py
+secrets.py
+
+# Local-only configuration
+config.local.*
+*.local.json
+*.local.yaml
+*.local.yml
+
+
+# -----------------------------------------------------------------------------
+# Experimental / participant data
+# -----------------------------------------------------------------------------
+
+# BIDS-style subject/session directories if accidentally copied into repo root
+/sub-*/
+/ses-*/
+
+# Generic raw-data directories
+/data/
+/raw/
+/recordings/
+/datasets/
+
+
+# -----------------------------------------------------------------------------
+# EEG / biosignal recording formats
+# -----------------------------------------------------------------------------
+
+# Lab Streaming Layer / XDF recordings
+*.xdf
+
+# MNE / FIF data
+*.fif
+*.fif.gz
+
+# Common EEG / biosignal formats
+*.edf
+*.bdf
+*.set
+*.vhdr
+*.vmrk
+*.eeg
+
+
+# -----------------------------------------------------------------------------
+# Generated / temporary scientific data
+# -----------------------------------------------------------------------------
+
+# Temporary arrays / caches
+*.tmp
+*.temp
+
+# MATLAB temporary/autosave files
+*.asv
+
+# Jupyter autosave/checkpoints already covered above, retained here for clarity
+.ipynb_checkpoints/
+
+
+# -----------------------------------------------------------------------------
+# Local logs
+# -----------------------------------------------------------------------------
+
+*.log
+logs/
+
+
+# -----------------------------------------------------------------------------
+# IDE / editor files
+# -----------------------------------------------------------------------------
+
+.vscode/
+.idea/
+
+*.code-workspace
+
+# Sublime Text
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+
+# Backup files
+*~
+*.bak
+
+
+# -----------------------------------------------------------------------------
+# Operating-system junk
+# -----------------------------------------------------------------------------
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux desktop metadata
+.directory
+
+
+# -----------------------------------------------------------------------------
+# Python local/runtime miscellany
+# -----------------------------------------------------------------------------
+
+.python-version
+
+# Type checking / language-server caches
+.pyright/
+.pyrightconfig.json
+
+# Profiling/debug output
+*.prof
+
+
+# -----------------------------------------------------------------------------
+# Keep curated portfolio outputs
+# -----------------------------------------------------------------------------
+
+# IMPORTANT:
+# Do NOT ignore results/*.png or media/*.jpg.
+# These are intentionally version-controlled as representative project evidence.
+
+# Likewise, .env.example is explicitly allowed above so users know
+# which environment variables the project expects.
