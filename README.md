@@ -143,6 +143,12 @@ Representative outputs from an exploratory motor-response recording.
 
 Raw participant recordings are intentionally excluded from the public repository.
 
+### `docs/`
+
+Technical documentation covering system architecture and timing.
+
+- [`synchronisation.md`](docs/synchronisation.md) — multimodal timing architecture, limitations and future hardware-level synchronisation
+
 ---
 
 ## Representative Results
